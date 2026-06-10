@@ -164,6 +164,18 @@ history = model.fit(
     callbacks       = callbacks
 )
 
+# Save history so you never lose it after a restart
+import json
+history_dict = {
+    'accuracy'     : history.history['accuracy'],
+    'val_accuracy' : history.history['val_accuracy'],
+    'loss'         : history.history['loss'],
+    'val_loss'     : history.history['val_loss']
+}
+with open('/content/drive/MyDrive/maize_leaf_disease_detection_prototype/history.json', 'w') as f:
+    json.dump(history_dict, f)
+print("History saved to Drive.")
+
 # Save class names to Drive
 with open('/content/drive/MyDrive/maize_leaf_disease_detection_prototype/class_names.json', 'w') as f:
     json.dump(class_names, f)
