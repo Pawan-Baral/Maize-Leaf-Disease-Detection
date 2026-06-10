@@ -181,6 +181,20 @@ with open('/content/drive/MyDrive/maize_leaf_disease_detection_prototype/class_n
     json.dump(class_names, f)
 
 print("\n✅ Training done! Model saved to your Google Drive.")
+# Load saved history from Drive
+import json
+
+with open('/content/drive/MyDrive/maize_leaf_disease_detection_prototype/history.json') as f:
+    saved = json.load(f)
+
+class FakeHistory:
+    def __init__(self, d):
+        self.history = d
+
+history = FakeHistory(saved)
+print("✅ History loaded successfully!")
+print("Epochs trained:", len(saved['accuracy']))
+print("Best val_accuracy:", round(max(saved['val_accuracy']) * 100, 2), "%")
 
 # ================================================================
 # CELL 7 — Plot Results
