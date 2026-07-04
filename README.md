@@ -202,7 +202,7 @@ After training each model, the following files are saved to `outputs/`:
 ## Authors
 
 - **Pawan** — Pokhara University, School of Engineering
-- Supervised by: [Supervisor Name]
+- Supervised by: Udaya Raj Dhungana
 
 ---
 
