@@ -156,17 +156,16 @@ To run on Colab or Kaggle, upload this repository and change the paths:
 DATASET_PATH = "/content/drive/MyDrive/maize_leaf_disease_detection_prototype/data"
 OUTPUT       = "/content/drive/MyDrive/maize_leaf_disease_detection_prototype/outputs"
 ```
----
-## Model workflow on Collab /Kaggle 
-Step 1 --> Load dataset required and the file path
-Step 2 --> Clean and Split the dataset
-Step 3 --> Loading the images (ImageDataGenerator)
-Step 4 --> Class Weight Assessment for the dataset
-Step 5 --> Build the model
-Step 6 --> First phase training
-Step 7 --> Second phase training (Fine tuning)
-Step 8 --> Evaluation of the performance (plots ,confusion matrix )
----
+### Model Workflow (Colab/Kaggle)
+
+1. Load the dataset and configure file paths.
+2. Clean and split the dataset.
+3. Load images using `ImageDataGenerator`.
+4. Compute class weights.
+5. Build the selected CNN model.
+6. Train Phase 1 (frozen base model).
+7. Train Phase 2 (fine-tuning).
+8. Evaluate the model (accuracy, confusion matrix, ROC curves, and plots).
 
 ## Outputs
 
