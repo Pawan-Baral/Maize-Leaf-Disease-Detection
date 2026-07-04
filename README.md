@@ -187,15 +187,7 @@ After training each model, the following files are saved to `outputs/`:
 
 *Update this table with your actual results after training.*
 
----
 
-## Future Work
-
-- GAN-based data augmentation for minority classes
-- Collection and integration of local Nepali maize leaf images
-- Fall Armyworm disease detection as a separate model
-- Mobile application deployment using Flutter + Flask REST API
-- Expand to 7 disease classes
 
 ---
 
