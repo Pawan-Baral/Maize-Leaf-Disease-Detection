@@ -156,6 +156,7 @@ To run on Colab or Kaggle, upload this repository and change the paths:
 DATASET_PATH = "/content/drive/MyDrive/maize_leaf_disease_detection_prototype/data"
 OUTPUT       = "/content/drive/MyDrive/maize_leaf_disease_detection_prototype/outputs"
 ```
+---
 ## Model workflow on Collab /Kaggle 
 Step 1 --> Load dataset required and the file path
 Step 2 --> Clean and Split the dataset
