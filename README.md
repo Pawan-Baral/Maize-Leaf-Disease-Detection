@@ -85,6 +85,7 @@ pip install -r requirements.txt
 Download the dataset from Kaggle:
 ```
 https://www.kaggle.com/datasets/yasirahmad0810/consolidated-corn-dataset
+# download the dataset from other soruces and group them in a folder named "data"
 ```
 
 Place the class folders inside a `data/` directory:
