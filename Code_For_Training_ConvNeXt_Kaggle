@@ -1,0 +1,716 @@
+# ============================================================
+#  MAIZE LEAF DISEASE DETECTION PROTOTYPE
+#  ConvNeXtTiny Training Script — Kaggle Notebook Version
+#
+#  Dataset  : Consolidated Corn Dataset (yasirahmad0810)
+#  Classes  : Blight | Common_Rust | Grey_Leaf_Spot | Healthy
+#  Platform : Kaggle (T4 GPU x2)
+#  Split    : 70% Train / 15% Validation / 15% Test
+#
+#  HOW TO USE:
+#  1. Add these datasets to your Kaggle notebook:
+#     - yasirahmad0810/consolidated-corn-dataset
+#     - your convnext-weights dataset (convnext_tiny_notop.h5)
+#  2. Set accelerator to GPU T4 x2
+#  3. Copy each CELL into a separate Kaggle cell
+#  4. Run top to bottom
+# ============================================================
+
+
+# ============================================================
+# CELL 1 — Imports and GPU Check
+# ============================================================
+import os, shutil, hashlib, json, random
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import ConvNeXtTiny
+from tensorflow.keras.callbacks import (
+    ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+)
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    roc_curve, auc, precision_score, recall_score, f1_score
+)
+from sklearn.preprocessing import label_binarize
+from PIL import Image
+
+print("TF version :", tf.__version__)
+print("GPU        :", tf.config.list_physical_devices('GPU'))
+
+# Find the dataset path automatically
+print("\n📂 Available datasets:")
+for root, dirs, files in os.walk("/kaggle/input"):
+    images = [f for f in files
+              if f.lower().endswith(('.jpg','.jpeg','.png'))]
+    if images:
+        print(f"   {root:<60} {len(images)} images")
+
+
+# ============================================================
+# CELL 2 — Configuration
+# ============================================================
+# Dataset path — update if your path differs from output of Cell 1
+DATASET_PATH = "/kaggle/input/datasets/yasirahmad0810"
+OUTPUT       = "/kaggle/working"
+IMG_SIZE     = (224, 224)   # ConvNeXt standard input size
+BATCH_SIZE   = 32
+SEED         = 42
+
+# Class folder names in dataset → standard names we use
+NAME_MAP = {
+    "Healthy"              : "Healthy",
+    "Gray Leaf Spot"       : "Grey_Leaf_Spot",
+    "Northern Leaf Blight" : "Blight",
+    "Common Rust"          : "Common_Rust",
+}
+CLASSES = list(set(NAME_MAP.values()))
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+print("Configuration set:")
+print(f"   DATASET_PATH : {DATASET_PATH}")
+print(f"   IMG_SIZE     : {IMG_SIZE}")
+print(f"   BATCH_SIZE   : {BATCH_SIZE}")
+print(f"   Classes      : {CLASSES}")
+
+# Verify dataset folders exist
+print("\n📂 Source dataset:")
+total = 0
+for folder, standard in NAME_MAP.items():
+    src = os.path.join(DATASET_PATH, folder)
+    if os.path.exists(src):
+        n = len([f for f in os.listdir(src)
+                 if f.lower().endswith(('.jpg','.jpeg','.png'))])
+        print(f"   {folder:<25} → {standard:<20} {n} images")
+        total += n
+    else:
+        print(f"   ⚠️  Not found: {folder}")
+print(f"\n   Total: {total} images")
+
+
+# ============================================================
+# CELL 3 — Copy, Clean and Split Dataset (70 / 15 / 15)
+#
+# Why copy first?
+#   /kaggle/input is READ-ONLY — we cannot modify files there.
+#   We copy to /kaggle/working/ where we can clean and split.
+#
+# Cleaning removes:
+#   - Corrupted images (can't be opened)
+#   - Too-small images (under 64x64)
+#   - Exact duplicates (same MD5 hash = same file)
+#
+# Split:
+#   Train (70%) → model trains on these
+#   Valid (15%) → checked after each epoch, never trained on
+#   Test  (15%) → final evaluation only, completely held out
+# ============================================================
+SPLIT_PATH = os.path.join(OUTPUT, "split_data")
+
+# Create folder structure: split_data/train/Blight/ etc.
+for split in ['train', 'valid', 'test']:
+    for cls in CLASSES:
+        os.makedirs(os.path.join(SPLIT_PATH, split, cls), exist_ok=True)
+
+seen    = set()   # stores MD5 hashes of seen images
+removed = 0
+totals  = {'train': 0, 'valid': 0, 'test': 0}
+
+print("🧹 Cleaning and splitting...\n")
+
+for folder, standard in NAME_MAP.items():
+    src   = os.path.join(DATASET_PATH, folder)
+    files = [f for f in os.listdir(src)
+             if f.lower().endswith(('.jpg','.jpeg','.png'))]
+
+    # ── Clean ───────────────────────────────────────────────
+    clean_files = []
+    for f in files:
+        path = os.path.join(src, f)
+
+        # Check for corruption
+        try:
+            img = Image.open(path); img.verify()
+            img = Image.open(path).convert("RGB")
+        except:
+            removed += 1; continue
+
+        # Check minimum size
+        if img.size[0] < 64 or img.size[1] < 64:
+            removed += 1; continue
+
+        # Check for duplicates using MD5 fingerprint
+        with open(path, 'rb') as fh:
+            h = hashlib.md5(fh.read()).hexdigest()
+        if h in seen:
+            removed += 1; continue
+        seen.add(h)
+        clean_files.append(f)
+
+    # ── Split ────────────────────────────────────────────────
+    random.shuffle(clean_files)
+    n       = len(clean_files)
+    n_train = int(n * 0.70)
+    n_valid = int(n * 0.15)
+
+    split_files = {
+        'train': clean_files[:n_train],
+        'valid': clean_files[n_train:n_train + n_valid],
+        'test' : clean_files[n_train + n_valid:]
+    }
+
+    # Copy to split folders
+    for split, sfiles in split_files.items():
+        dst = os.path.join(SPLIT_PATH, split, standard)
+        for i, f in enumerate(sfiles):
+            shutil.copy2(
+                os.path.join(src, f),
+                os.path.join(dst, f"{standard[:4]}_{i}_{f}")
+            )
+        totals[split] += len(sfiles)
+
+    print(f"   {standard:<20} "
+          f"train={len(split_files['train'])}  "
+          f"valid={len(split_files['valid'])}  "
+          f"test={len(split_files['test'])}")
+
+print(f"\n   Removed (corrupt/duplicate): {removed}")
+print(f"\n📊 Final split:")
+print(f"   Train : {totals['train']} images  (70%)")
+print(f"   Valid : {totals['valid']} images  (15%)")
+print(f"   Test  : {totals['test']} images   (15%)")
+print("✅ Done")
+
+
+# ============================================================
+# CELL 4 — Load Images with ImageDataGenerator
+#
+# Train set gets augmentation — model sees variety and
+# doesn't memorise exact images (prevents overfitting)
+#
+# Valid and Test get NO augmentation — evaluated on
+# realistic unmodified images for honest measurement
+#
+# NO rescale=1/255 here because ConvNeXt has its own
+# preprocessing layer (preprocess_input) that handles
+# normalisation internally
+# ============================================================
+train_datagen = ImageDataGenerator(
+    rotation_range     = 20,    # rotate up to 20 degrees
+    width_shift_range  = 0.2,   # shift left/right
+    height_shift_range = 0.2,   # shift up/down
+    horizontal_flip    = True,  # mirror left-right
+    zoom_range         = 0.2,   # zoom in/out
+)
+plain_datagen = ImageDataGenerator()   # no augmentation
+
+train_ds = train_datagen.flow_from_directory(
+    os.path.join(SPLIT_PATH, 'train'),
+    target_size = IMG_SIZE,
+    batch_size  = BATCH_SIZE,
+    class_mode  = 'sparse',    # integer labels: 0, 1, 2, 3
+    shuffle     = True
+)
+val_ds = plain_datagen.flow_from_directory(
+    os.path.join(SPLIT_PATH, 'valid'),
+    target_size = IMG_SIZE,
+    batch_size  = BATCH_SIZE,
+    class_mode  = 'sparse',
+    shuffle     = False        # keep order for evaluation
+)
+test_ds = plain_datagen.flow_from_directory(
+    os.path.join(SPLIT_PATH, 'test'),
+    target_size = IMG_SIZE,
+    batch_size  = BATCH_SIZE,
+    class_mode  = 'sparse',
+    shuffle     = False
+)
+
+class_names = list(train_ds.class_indices.keys())
+num_classes = len(class_names)
+
+print(f"✅ Classes : {class_names}")
+print(f"   Train   : {train_ds.samples}")
+print(f"   Valid   : {val_ds.samples}")
+print(f"   Test    : {test_ds.samples}")
+
+# Save class names for prediction later
+with open(os.path.join(OUTPUT, 'class_names.json'), 'w') as f:
+    json.dump(class_names, f)
+
+
+# ============================================================
+# CELL 5 — Cache ConvNeXt Weights
+#
+# Kaggle blocks internet access during notebook runs.
+# We upload the weights file as a separate Kaggle dataset
+# and cache it to ~/.keras/models/ so TensorFlow finds it
+# automatically when building the model.
+#
+# Download weights from:
+# https://storage.googleapis.com/tensorflow/keras-applications/convnext/convnext_tiny_notop.h5
+# Upload as Kaggle dataset called "convnext-weights"
+# Add it to this notebook via Add Data
+# ============================================================
+weights_cached = False
+
+for root, dirs, files in os.walk("/kaggle/input"):
+    for f in files:
+        if "convnext_tiny" in f.lower() and f.endswith(".h5"):
+            weights_path = os.path.join(root, f)
+            cache_dir    = os.path.expanduser("~/.keras/models/")
+            os.makedirs(cache_dir, exist_ok=True)
+            shutil.copy2(weights_path,
+                         os.path.join(cache_dir, f))
+            print(f"✅ ConvNeXt weights cached")
+            print(f"   Source : {weights_path}")
+            print(f"   Cached : {cache_dir}{f}")
+            weights_cached = True
+
+if not weights_cached:
+    print("❌ ConvNeXt weights not found!")
+    print("   Add the convnext-weights dataset to this notebook")
+    print("   Download from:")
+    print("   https://storage.googleapis.com/tensorflow/keras-applications/convnext/convnext_tiny_notop.h5")
+
+
+# ============================================================
+# CELL 6 — Build ConvNeXtTiny Model
+#
+# What is ConvNeXtTiny?
+#   Released by Meta in 2022. A pure CNN modernised with
+#   design principles from Vision Transformers.
+#   Key differences from MobileNetV2 / ResNet:
+#     - Uses depthwise convolutions (like MobileNet)
+#     - Uses LayerNorm instead of BatchNorm
+#     - Uses GELU activation instead of ReLU
+#     - Inverted bottleneck blocks (wider middle)
+#     - Trained with AdamW optimizer + weight decay
+#   Result: better accuracy than ResNet50 at similar size
+#
+# Why it fits our project title "CNN":
+#   ConvNeXt is a pure convolutional architecture.
+#   It qualifies fully as a CNN.
+#
+# Model structure:
+#   Input (224×224×3)
+#     ↓
+#   preprocess_input      ← ConvNeXt normalisation
+#     ↓
+#   ConvNeXtTiny base     ← pre-trained on ImageNet (FROZEN Phase 1)
+#     ↓
+#   GlobalAveragePooling  ← flatten feature maps to 1D
+#     ↓
+#   LayerNormalization    ← ConvNeXt style normalisation
+#     ↓
+#   Dense(256, gelu)      ← learns disease patterns
+#     ↓
+#   Dropout(0.4)
+#     ↓
+#   Dense(128, gelu)
+#     ↓
+#   Dropout(0.3)
+#     ↓
+#   Dense(4, softmax)     ← 4 disease probabilities
+# ============================================================
+
+# Functional API used (not Sequential) because we need
+# a preprocessing layer before the base model
+inputs = tf.keras.Input(shape=(*IMG_SIZE, 3))
+
+# ConvNeXt preprocessing — normalises with ImageNet mean/std
+x = tf.keras.applications.convnext.preprocess_input(inputs)
+
+# Load ConvNeXtTiny base — will use cached weights file
+base_model = ConvNeXtTiny(
+    weights     = 'imagenet',
+    include_top = False,          # remove original classifier
+    input_shape = (*IMG_SIZE, 3)
+)
+
+# Freeze base model for Phase 1
+# Pre-trained weights are valuable — don't let random
+# gradients from untrained head destroy them
+base_model.trainable = False
+
+x       = base_model(x, training=False)
+x       = layers.GlobalAveragePooling2D()(x)
+x       = layers.LayerNormalization()(x)      # ConvNeXt uses LayerNorm
+x       = layers.Dense(256, activation='gelu')(x)  # GELU fits ConvNeXt style
+x       = layers.Dropout(0.4)(x)
+x       = layers.Dense(128, activation='gelu')(x)
+x       = layers.Dropout(0.3)(x)
+outputs = layers.Dense(num_classes, activation='softmax')(x)
+
+model = tf.keras.Model(inputs, outputs)
+
+# ConvNeXt works best with AdamW optimizer
+# AdamW adds weight decay — penalises large weights
+# which acts as an extra regularisation technique
+model.compile(
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate = 0.001,
+        weight_decay  = 1e-4    # L2 regularisation
+    ),
+    loss    = 'sparse_categorical_crossentropy',
+    metrics = ['accuracy']
+)
+
+print(f"✅ ConvNeXtTiny model built")
+print(f"   Total layers     : {len(base_model.layers)}")
+print(f"   Total parameters : {model.count_params():,}")
+model.summary()
+
+
+# ============================================================
+# CELL 7 — Class Weights
+#
+# Dataset has imbalanced classes:
+#   Healthy              2200  ← lots
+#   Gray Leaf Spot       2010  ← lots
+#   Common Rust          1321  ← fewer
+#   Northern Leaf Blight  985  ← fewest
+#
+# Class weights compensate — model penalised more for
+# mistakes on minority classes (Blight, Common Rust)
+# ============================================================
+cw_array = compute_class_weight(
+    class_weight = 'balanced',
+    classes      = np.unique(train_ds.classes),
+    y            = train_ds.classes
+)
+class_weight_dict = dict(enumerate(cw_array))
+
+print("⚖️  Class weights:")
+for i, name in enumerate(class_names):
+    print(f"   {name:<20} {cw_array[i]:.3f}")
+# Higher weight = more attention paid to that class
+
+
+# ============================================================
+# CELL 8 — Define Callbacks
+#
+# ModelCheckpoint  → saves best model whenever val_accuracy
+#                    improves. Never lose the best version.
+#
+# EarlyStopping    → stops training if val_accuracy doesn't
+#                    improve for 5 consecutive epochs.
+#                    Prevents overfitting and saves GPU time.
+#
+# ReduceLROnPlateau → halves learning rate if val_loss
+#                    plateaus for 3 epochs. Helps model
+#                    converge more carefully.
+# ============================================================
+CKPT_DIR = os.path.join(OUTPUT, "checkpoints")
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+def get_callbacks(prefix):
+    return [
+        ModelCheckpoint(
+            filepath       = os.path.join(CKPT_DIR, f"{prefix}_best.keras"),
+            monitor        = 'val_accuracy',
+            save_best_only = True,
+            verbose        = 1
+        ),
+        EarlyStopping(
+            monitor              = 'val_accuracy',
+            patience             = 5,
+            restore_best_weights = True,
+            verbose              = 1
+        ),
+        ReduceLROnPlateau(
+            monitor  = 'val_loss',
+            factor   = 0.5,       # new_lr = old_lr * 0.5
+            patience = 3,
+            min_lr   = 1e-7,
+            verbose  = 1
+        )
+    ]
+
+
+# ============================================================
+# CELL 9 — Phase 1 Training: Frozen Base
+#
+# Phase 1 strategy:
+#   - ConvNeXtTiny base is FROZEN — weights don't change
+#   - Only Dense layers (our classification head) train
+#   - Learning rate 0.001 — fast learning on new layers
+#   - Goal: stabilise classification head before fine-tuning
+#
+# Expected result: val_accuracy reaches 0.75-0.90
+# ============================================================
+print("🌽 Phase 1 — ConvNeXtTiny frozen base...\n")
+EPOCHS_P1 = 10
+
+history = model.fit(
+    train_ds,
+    validation_data = val_ds,
+    epochs          = EPOCHS_P1,
+    callbacks       = get_callbacks("convnext_p1"),
+    class_weight    = class_weight_dict
+)
+
+# Save history — survives session timeout
+with open(os.path.join(OUTPUT, 'convnext_history_p1.json'), 'w') as f:
+    json.dump(history.history, f)
+
+best_p1 = max(history.history['val_accuracy'])
+print(f"\n✅ Phase 1 complete")
+print(f"   Best val accuracy : {best_p1*100:.2f}%")
+print(f"   Epochs trained    : {len(history.history['accuracy'])}")
+
+
+# ============================================================
+# CELL 10 — Phase 2 Training: Fine-Tuning
+#
+# Phase 2 strategy:
+#   - Unfreeze top layers of ConvNeXtTiny base
+#   - Keep first 100 layers frozen (early structural layers)
+#   - Learning rate 0.00005 — 20x lower than Phase 1
+#     to make tiny, careful adjustments
+#   - Weight decay also lowered
+#   - Goal: specialise base model for maize diseases
+#
+# Why keep early layers frozen?
+#   Early layers detect basic features (edges, colours,
+#   simple textures) that are useful for ALL images.
+#   Only deep layers need specialising for our task.
+#
+# Expected: val_accuracy improves 2-8% over Phase 1
+# ============================================================
+
+# Unfreeze ConvNeXtTiny base
+base_model.trainable = True
+
+# Freeze first 100 layers — keep generic feature detectors
+FINE_TUNE_AT = 100
+for layer in base_model.layers[:FINE_TUNE_AT]:
+    layer.trainable = False
+
+trainable = sum([l.trainable for l in base_model.layers])
+print(f"Trainable base layers : {trainable}/{len(base_model.layers)}")
+
+# Recompile with lower LR and lower weight decay
+model.compile(
+    optimizer = tf.keras.optimizers.AdamW(
+        learning_rate = 0.00005,
+        weight_decay  = 1e-5
+    ),
+    loss    = 'sparse_categorical_crossentropy',
+    metrics = ['accuracy']
+)
+
+EPOCHS_P2    = 20
+TOTAL_EPOCHS = EPOCHS_P1 + EPOCHS_P2
+
+print(f"\n🌽 Phase 2 — ConvNeXtTiny fine-tuning...\n")
+
+history_fine = model.fit(
+    train_ds,
+    validation_data = val_ds,
+    epochs          = TOTAL_EPOCHS,
+    initial_epoch   = history.epoch[-1],   # continue from Phase 1
+    callbacks       = get_callbacks("convnext_p2"),
+    class_weight    = class_weight_dict
+)
+
+# Save Phase 2 history
+with open(os.path.join(OUTPUT, 'convnext_history_p2.json'), 'w') as f:
+    json.dump(history_fine.history, f)
+
+# Save final model to Kaggle output tab
+model.save(os.path.join(OUTPUT, 'convnext_final.keras'))
+
+best_p2 = max(history_fine.history['val_accuracy'])
+print(f"\n✅ ConvNeXtTiny training complete!")
+print(f"   Phase 1 best val acc : {best_p1*100:.2f}%")
+print(f"   Phase 2 best val acc : {best_p2*100:.2f}%")
+print(f"   Model saved to Output tab")
+
+
+# ============================================================
+# CELL 11 — Plot Training History
+#
+# Two plots side by side:
+#   Accuracy — should increase over epochs
+#   Loss     — should decrease over epochs
+#
+# Dashed vertical line shows where Phase 2 begins.
+# Gap between train and val = overfitting gap.
+# Small gap = good generalisation.
+# ============================================================
+
+with open(os.path.join(OUTPUT, 'convnext_history_p1.json')) as f:
+    h1 = json.load(f)
+with open(os.path.join(OUTPUT, 'convnext_history_p2.json')) as f:
+    h2 = json.load(f)
+
+# Combine Phase 1 and Phase 2
+acc      = h1['accuracy']     + h2['accuracy']
+val_acc  = h1['val_accuracy'] + h2['val_accuracy']
+loss     = h1['loss']         + h2['loss']
+val_loss = h1['val_loss']     + h2['val_loss']
+p1_end   = len(h1['accuracy'])
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle('ConvNeXtTiny — Training History (Phase 1 + Phase 2)',
+             fontsize=14, fontweight='bold')
+
+for ax, train_vals, val_vals, title in zip(
+    axes,
+    [acc,  loss],
+    [val_acc, val_loss],
+    ['Accuracy', 'Loss']
+):
+    ax.plot(train_vals, label='Train',      marker='o', markersize=3)
+    ax.plot(val_vals,   label='Validation', marker='o', markersize=3)
+    ax.axvline(x=p1_end, color='gray', linestyle='--',
+               linewidth=1, label='Phase 2 starts')
+    ax.set_title(title)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT, 'convnext_training_history.png'), dpi=150)
+plt.show()
+print("📊 Training history saved")
+
+
+# ============================================================
+# CELL 12 — Full Evaluation on Test Set
+#
+# Test set = images the model has NEVER seen.
+# This gives the most honest measure of real-world performance.
+#
+# We generate:
+#   1. Classification report — precision, recall, F1 per class
+#   2. Confusion matrix      — which classes were confused
+#   3. Per-class accuracy    — bar chart per disease
+#   4. ROC curves            — AUC score per class
+#   5. Summary table         — all metrics in one place
+# ============================================================
+colors = ['#2196F3', '#FF5722', '#4CAF50', '#9C27B0']
+
+print("🔍 Evaluating ConvNeXtTiny on test set...")
+test_ds.reset()
+preds        = model.predict(test_ds, verbose=1)
+pred_classes = np.argmax(preds, axis=1)
+true_classes = test_ds.classes
+
+# ── 1. Classification Report ─────────────────────────────────
+print(f"\n{'='*60}")
+print("CONVNEXTTINY — CLASSIFICATION REPORT (TEST SET)")
+print(f"{'='*60}")
+report = classification_report(
+    true_classes, pred_classes, target_names=class_names
+)
+print(report)
+with open(os.path.join(OUTPUT, 'convnext_classification_report.txt'), 'w') as f:
+    f.write("CONVNEXTTINY — TEST SET CLASSIFICATION REPORT\n\n")
+    f.write(report)
+
+# ── 2. Confusion Matrix ───────────────────────────────────────
+cm = confusion_matrix(true_classes, pred_classes)
+plt.figure(figsize=(8, 6))
+sns.heatmap(
+    cm, annot=True, fmt='d', cmap='Purples',
+    xticklabels=class_names,
+    yticklabels=class_names,
+    linewidths=0.5
+)
+plt.title('ConvNeXtTiny — Confusion Matrix (Test Set)',
+          fontsize=14, fontweight='bold')
+plt.ylabel('Actual Label',    fontsize=12)
+plt.xlabel('Predicted Label', fontsize=12)
+plt.xticks(rotation=30, ha='right')
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT, 'convnext_confusion_matrix.png'), dpi=150)
+plt.show()
+
+# ── 3. Per-class Accuracy Bar Chart ──────────────────────────
+per_class_acc = cm.diagonal() / cm.sum(axis=1)
+plt.figure(figsize=(9, 5))
+bars = plt.bar(class_names, per_class_acc * 100, color=colors)
+plt.title('ConvNeXtTiny — Per-Class Accuracy (Test Set)',
+          fontsize=14, fontweight='bold')
+plt.ylabel('Accuracy (%)')
+plt.ylim([0, 115])
+plt.xticks(rotation=20, ha='right')
+for bar, acc in zip(bars, per_class_acc):
+    plt.text(
+        bar.get_x() + bar.get_width() / 2,
+        bar.get_height() + 1.5,
+        f'{acc*100:.1f}%',
+        ha='center', fontsize=11, fontweight='bold'
+    )
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT, 'convnext_per_class_accuracy.png'), dpi=150)
+plt.show()
+
+# ── 4. ROC Curves ─────────────────────────────────────────────
+true_bin = label_binarize(true_classes, classes=list(range(num_classes)))
+plt.figure(figsize=(9, 6))
+for i, (name, color) in enumerate(zip(class_names, colors)):
+    fpr, tpr, _ = roc_curve(true_bin[:, i], preds[:, i])
+    roc_auc     = auc(fpr, tpr)
+    plt.plot(fpr, tpr, color=color, linewidth=2,
+             label=f'{name}  AUC = {roc_auc:.2f}')
+plt.plot([0, 1], [0, 1], 'k--', linewidth=1)
+plt.xlim([0, 1])
+plt.ylim([0, 1.02])
+plt.title('ConvNeXtTiny — ROC Curves (Test Set)',
+          fontsize=14, fontweight='bold')
+plt.xlabel('False Positive Rate', fontsize=12)
+plt.ylabel('True Positive Rate',  fontsize=12)
+plt.legend(loc='lower right', fontsize=10)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT, 'convnext_roc_curves.png'), dpi=150)
+plt.show()
+
+# ── 5. Final Metrics Summary ──────────────────────────────────
+p       = precision_score(true_classes, pred_classes, average=None)
+r       = recall_score(true_classes,    pred_classes, average=None)
+f       = f1_score(true_classes,        pred_classes, average=None)
+overall = np.mean(pred_classes == true_classes)
+
+print(f"\n{'='*65}")
+print("CONVNEXTTINY — FINAL TEST METRICS SUMMARY")
+print(f"{'='*65}")
+print(f"{'Class':<22}{'Precision':>10}{'Recall':>8}"
+      f"{'F1':>8}{'Accuracy':>10}")
+print("-"*65)
+for i, name in enumerate(class_names):
+    print(f"{name:<22}{p[i]:>10.3f}{r[i]:>8.3f}"
+          f"{f[i]:>8.3f}{per_class_acc[i]:>9.1%}")
+print("-"*65)
+print(f"{'Overall (macro avg)':<22}"
+      f"{precision_score(true_classes,pred_classes,average='macro'):>10.3f}"
+      f"{recall_score(true_classes,pred_classes,average='macro'):>8.3f}"
+      f"{f1_score(true_classes,pred_classes,average='macro'):>8.3f}"
+      f"{overall:>9.1%}")
+print("="*65)
+
+# Save results JSON — used by compare_models.py later
+results = {
+    'model'    : 'ConvNeXtTiny',
+    'accuracy' : float(overall),
+    'precision': float(precision_score(true_classes, pred_classes, average='macro')),
+    'recall'   : float(recall_score(true_classes,    pred_classes, average='macro')),
+    'f1'       : float(f1_score(true_classes,        pred_classes, average='macro')),
+}
+with open(os.path.join(OUTPUT, 'ConvNeXtTiny_results.json'), 'w') as f:
+    json.dump(results, f, indent=2)
+
+print(f"\n📊 All outputs saved to Output tab — download from right sidebar")
+print(f"✅ ConvNeXtTiny evaluation complete!")
