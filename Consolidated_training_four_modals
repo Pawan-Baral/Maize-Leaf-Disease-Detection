@@ -1,0 +1,2386 @@
+"""Train and compare four ImageNet backbones on consolidated maize leaves.
+
+Kaggle setup
+------------
+1. Attach: yasirahmad0810/consolidated-corn-dataset
+2. Enable a GPU accelerator.
+3. Paste this file into one notebook cell and run it.
+
+The script trains MobileNetV2, EfficientNetB0, ResNet50, and ConvNeXtTiny
+with one fixed, duplicate-aware 70/15/15 split. Only images located inside
+the four exact whitelisted maize folders are eligible; every other dataset
+folder is ignored. Each model uses the same augmentation and classifier head:
+
+    224x224 RGB -> augmentation -> backbone -> GlobalAveragePooling2D
+    -> Dropout(0.30) -> Dense(4, softmax)
+
+At the end, the exact implemented architecture of every model is exported as
+text, JSON, CSV, a Keras diagram, and a compact report-ready SVG/PDF/PNG.
+The evaluation package includes confusion matrices, per-class diagnostics,
+ROC and precision-recall curves, calibration, uncertainty intervals, error
+examples, model size, GPU inference speed, and cross-model comparison plots.
+"""
+
+import gc
+import hashlib
+import json
+import os
+import platform
+import random
+import shutil
+import subprocess
+import threading
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import tensorflow as tf
+from PIL import Image, UnidentifiedImageError
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    average_precision_score,
+    balanced_accuracy_score,
+    classification_report,
+    cohen_kappa_score,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    matthews_corrcoef,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_curve,
+    roc_auc_score,
+    top_k_accuracy_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import label_binarize
+from tensorflow.keras import layers, mixed_precision
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+# ============================================================
+# 1. SETTINGS — EDIT ONLY THIS SECTION WHEN NEEDED
+# ============================================================
+
+DATASET_ROOT = Path("/kaggle/input/consolidated-corn-dataset")
+WORK_ROOT = Path("/kaggle/working/maize_four_backbones")
+
+# "all" trains all four in sequence.
+# "single" trains only SINGLE_MODEL; useful if Kaggle time/GPU RAM is limited.
+RUN_MODE = "all"
+SINGLE_MODEL = "MobileNetV2"
+
+MODEL_ORDER = [
+    "MobileNetV2",
+    "EfficientNetB0",
+    "ResNet50",
+    "ConvNeXtTiny",
+]
+
+IMAGE_SIZE = (224, 224)
+SEED = 42
+TRAIN_RATIO = 0.70
+VALID_RATIO = 0.15
+TEST_RATIO = 0.15
+
+EPOCHS_PHASE1 = 10
+EPOCHS_PHASE2 = 20
+LEARNING_RATE_PHASE1 = 1e-3
+LEARNING_RATE_PHASE2 = 1e-5
+FINE_TUNE_FRACTION = 0.20
+EARLY_STOPPING_PATIENCE = 5
+DROPOUT_RATE = 0.30
+
+USE_MIXED_PRECISION = True
+REQUIRE_GPU = True
+REUSE_MANIFEST = True
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
+
+# Visible execution and resource reporting. A snapshot is printed periodically
+# during long operations and after every training epoch.
+SHOW_RESOURCE_MONITOR = True
+RESOURCE_MONITOR_INTERVAL_SECONDS = 30
+IMAGE_SCAN_PROGRESS_EVERY = 500
+
+# Research evaluation and efficiency benchmarking.
+BOOTSTRAP_REPEATS = 1000
+CONFIDENCE_LEVEL = 0.95
+CALIBRATION_BINS = 10
+BENCHMARK_REPEATS = 30
+MAX_ERROR_EXAMPLES = 16
+
+# These are the only dataset folders that may contribute training images.
+# Folder matching is exact and case-sensitive. All other folders are skipped.
+REQUIRED_CLASS_FOLDERS = {
+    "CORN_LEAF_BLIGHT": "Blight",
+    "CORN_LEAF_RUST": "Common_Rust",
+    "CORN_LEAF_GRAY_SPOT": "Grey_Leaf_Spot",
+    "CORN_HEALTHY": "Healthy",
+}
+
+# Keep this output-label order unchanged in training, evaluation, and deployment.
+CLASS_NAMES = ["Blight", "Common_Rust", "Grey_Leaf_Spot", "Healthy"]
+CLASS_TO_INDEX = {name: index for index, name in enumerate(CLASS_NAMES)}
+
+# Batch size differs only because backbone memory requirements differ.
+MODEL_CONFIGS = {
+    "MobileNetV2": {
+        "constructor_name": "MobileNetV2",
+        "preprocess": "mobilenet_v2",
+        "batch_size": 32,
+    },
+    "EfficientNetB0": {
+        "constructor_name": "EfficientNetB0",
+        "preprocess": "internal",
+        "batch_size": 32,
+    },
+    "ResNet50": {
+        "constructor_name": "ResNet50",
+        "preprocess": "resnet50",
+        "batch_size": 32,
+    },
+    "ConvNeXtTiny": {
+        "constructor_name": "ConvNeXtTiny",
+        "preprocess": "internal",
+        "batch_size": 16,
+    },
+}
+
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
+SHARED_DIR = WORK_ROOT / "shared_data"
+SHARED_DIR.mkdir(parents=True, exist_ok=True)
+MANIFEST_PATH = SHARED_DIR / "split_manifest.csv"
+PROGRESS_LOG_PATH = WORK_ROOT / "execution_progress.log"
+STATUS_PATH = WORK_ROOT / "current_execution_status.json"
+
+
+# ============================================================
+# VISIBLE EXECUTION PROGRESS AND RESOURCE MONITORING
+# ============================================================
+
+
+RUN_START_TIME = time.perf_counter()
+_progress_lock = threading.Lock()
+
+
+def elapsed_text(seconds=None):
+    seconds = time.perf_counter() - RUN_START_TIME if seconds is None else seconds
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def gpu_snapshot():
+    """Return NVIDIA utilization when nvidia-smi is available on Kaggle."""
+    command = [
+        "nvidia-smi",
+        "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        first_gpu = completed.stdout.strip().splitlines()[0]
+        name, utilization, used, total, temperature = [
+            value.strip() for value in first_gpu.split(",")
+        ]
+        return {
+            "name": name,
+            "utilization_percent": float(utilization),
+            "memory_used_mb": float(used),
+            "memory_total_mb": float(total),
+            "temperature_c": float(temperature),
+        }
+    except Exception:
+        return None
+
+
+def resource_snapshot():
+    snapshot = {
+        "elapsed": elapsed_text(),
+        "logical_cpu_count": os.cpu_count(),
+    }
+    if psutil is not None:
+        memory = psutil.virtual_memory()
+        process = psutil.Process(os.getpid())
+        snapshot.update(
+            {
+                "physical_cpu_count": psutil.cpu_count(logical=False),
+                "cpu_utilization_percent": psutil.cpu_percent(interval=None),
+                "ram_used_gb": memory.used / (1024 ** 3),
+                "ram_total_gb": memory.total / (1024 ** 3),
+                "ram_utilization_percent": memory.percent,
+                "process_ram_gb": process.memory_info().rss / (1024 ** 3),
+            }
+        )
+    gpu = gpu_snapshot()
+    if gpu is not None:
+        snapshot["gpu"] = gpu
+    try:
+        tf_memory = tf.config.experimental.get_memory_info("GPU:0")
+        snapshot["tensorflow_gpu_current_mb"] = tf_memory["current"] / (1024 ** 2)
+        snapshot["tensorflow_gpu_peak_mb"] = tf_memory["peak"] / (1024 ** 2)
+    except Exception:
+        pass
+    return snapshot
+
+
+def format_resources(snapshot):
+    parts = [f"elapsed {snapshot['elapsed']}"]
+    if "cpu_utilization_percent" in snapshot:
+        parts.append(
+            f"CPU {snapshot['cpu_utilization_percent']:.1f}% "
+            f"({snapshot.get('physical_cpu_count', '?')} physical / "
+            f"{snapshot.get('logical_cpu_count', '?')} logical cores)"
+        )
+        parts.append(
+            f"RAM {snapshot['ram_used_gb']:.1f}/{snapshot['ram_total_gb']:.1f} GB "
+            f"({snapshot['ram_utilization_percent']:.1f}%)"
+        )
+        parts.append(f"process RAM {snapshot['process_ram_gb']:.2f} GB")
+    gpu = snapshot.get("gpu")
+    if gpu is not None:
+        parts.append(
+            f"GPU {gpu['name']} {gpu['utilization_percent']:.0f}%"
+        )
+        parts.append(
+            f"GPU RAM {gpu['memory_used_mb']:.0f}/{gpu['memory_total_mb']:.0f} MB"
+        )
+        parts.append(f"GPU temp {gpu['temperature_c']:.0f} C")
+    elif GPUS if "GPUS" in globals() else False:
+        parts.append("GPU detected (nvidia-smi utilization unavailable)")
+    return " | ".join(parts)
+
+
+def progress(stage, message, include_resources=False, **extra):
+    """Print, log, and save the most recent execution stage."""
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    line = f"[{timestamp}] [{elapsed_text()}] {stage}: {message}"
+    snapshot = resource_snapshot() if include_resources else None
+    if snapshot is not None:
+        line += "\n    " + format_resources(snapshot)
+    status = {
+        "timestamp": timestamp,
+        "elapsed": elapsed_text(),
+        "stage": stage,
+        "message": message,
+        "resources": snapshot,
+        **extra,
+    }
+    with _progress_lock:
+        print("\n" + line, flush=True)
+        with PROGRESS_LOG_PATH.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
+        STATUS_PATH.write_text(json.dumps(status, indent=2), encoding="utf-8")
+
+
+class LiveResourceMonitor:
+    """Print resource use while a long Kaggle operation is running."""
+
+    def __init__(self, label):
+        self.label = label
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def start(self):
+        if not SHOW_RESOURCE_MONITOR:
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop_event.wait(RESOURCE_MONITOR_INTERVAL_SECONDS):
+            progress("RESOURCE MONITOR", self.label, include_resources=True)
+
+    def stop(self):
+        if self.thread is not None:
+            self.stop_event.set()
+            self.thread.join(timeout=5)
+            self.thread = None
+
+
+class EpochProgressCallback(tf.keras.callbacks.Callback):
+    """Show exactly which phase/epoch is running and the resources it used."""
+
+    def __init__(self, model_name, phase_name, first_epoch, total_phase_epochs):
+        super().__init__()
+        self.model_name = model_name
+        self.phase_name = phase_name
+        self.first_epoch = first_epoch
+        self.total_phase_epochs = total_phase_epochs
+        self.epoch_start = None
+        self.monitor = None
+
+    def on_train_begin(self, logs=None):
+        self.monitor = LiveResourceMonitor(
+            f"{self.model_name} / {self.phase_name} is training"
+        )
+        self.monitor.start()
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.epoch_start = time.perf_counter()
+        phase_epoch = epoch - self.first_epoch + 1
+        progress(
+            "TRAINING",
+            f"{self.model_name} | {self.phase_name} | "
+            f"epoch {phase_epoch}/{self.total_phase_epochs} started",
+            include_resources=True,
+            model=self.model_name,
+            phase=self.phase_name,
+            epoch=phase_epoch,
+            total_epochs=self.total_phase_epochs,
+        )
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        phase_epoch = epoch - self.first_epoch + 1
+        duration = time.perf_counter() - self.epoch_start
+        metric_text = ", ".join(
+            f"{key}={float(value):.4f}"
+            for key, value in logs.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        )
+        progress(
+            "EPOCH COMPLETE",
+            f"{self.model_name} | {self.phase_name} | "
+            f"epoch {phase_epoch}/{self.total_phase_epochs} | "
+            f"epoch time {elapsed_text(duration)} | {metric_text}",
+            include_resources=True,
+            model=self.model_name,
+            phase=self.phase_name,
+            epoch=phase_epoch,
+            total_epochs=self.total_phase_epochs,
+            metrics={key: float(value) for key, value in logs.items()},
+        )
+
+    def on_train_end(self, logs=None):
+        if self.monitor is not None:
+            self.monitor.stop()
+        progress(
+            "TRAINING PHASE COMPLETE",
+            f"{self.model_name} | {self.phase_name}",
+            include_resources=True,
+        )
+
+
+# ============================================================
+# 2. REPRODUCIBILITY, GPU, AND PRECISION
+# ============================================================
+
+
+def seed_everything(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.keras.utils.set_random_seed(seed)
+
+
+seed_everything()
+
+try:
+    tf.config.experimental.enable_op_determinism()
+except Exception:
+    pass
+
+GPUS = tf.config.list_physical_devices("GPU")
+if REQUIRE_GPU and not GPUS:
+    raise RuntimeError(
+        "No GPU was detected. In Kaggle open Settings -> Accelerator -> GPU, "
+        "save the setting, restart the session, and run this cell again."
+    )
+
+for gpu in GPUS:
+    try:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError:
+        pass
+
+
+def verify_gpu_execution():
+    """Run and synchronize one real TensorFlow operation on GPU:0."""
+    if not GPUS:
+        return None
+    with tf.device("/GPU:0"):
+        left = tf.random.uniform((1024, 1024), dtype=tf.float32, seed=SEED)
+        right = tf.random.uniform((1024, 1024), dtype=tf.float32, seed=SEED + 1)
+        product = tf.matmul(left, right)
+        checksum = float(tf.reduce_sum(product).numpy())
+    return {"tensor_device": product.device, "checksum": checksum}
+
+
+def supports_fast_float16():
+    if not GPUS:
+        return False
+    try:
+        details = tf.config.experimental.get_device_details(GPUS[0])
+        capability = details.get("compute_capability")
+        return capability is not None and int(capability[0]) >= 7
+    except Exception:
+        return False
+
+
+if USE_MIXED_PRECISION and supports_fast_float16():
+    mixed_precision.set_global_policy("mixed_float16")
+else:
+    mixed_precision.set_global_policy("float32")
+
+PROGRESS_LOG_PATH.write_text("", encoding="utf-8")
+gpu_execution_test = verify_gpu_execution()
+progress(
+    "STAGE 1 — RUNTIME READY",
+    f"TensorFlow {tf.__version__}; precision="
+    f"{mixed_precision.global_policy().name}; dataset={DATASET_ROOT}; "
+    f"execution_device="
+    f"{gpu_execution_test['tensor_device'] if gpu_execution_test else 'CPU'}",
+    include_resources=True,
+)
+
+gpu_details = []
+for gpu in GPUS:
+    try:
+        details = tf.config.experimental.get_device_details(gpu)
+    except Exception:
+        details = {}
+    gpu_details.append(
+        {
+            "name": gpu.name,
+            "device_type": gpu.device_type,
+            "device_name": details.get("device_name", "unknown"),
+            "compute_capability": str(details.get("compute_capability", "unknown")),
+        }
+    )
+
+runtime_info = {
+    "python": platform.python_version(),
+    "tensorflow": tf.__version__,
+    "platform": platform.platform(),
+    "physical_gpus": gpu_details,
+    "logical_gpus": [device.name for device in tf.config.list_logical_devices("GPU")],
+    "mixed_precision_policy": mixed_precision.global_policy().name,
+    "gpu_required": REQUIRE_GPU,
+    "gpu_execution_test": gpu_execution_test,
+    "startup_resources": resource_snapshot(),
+}
+with (SHARED_DIR / "runtime_environment.json").open("w") as file:
+    json.dump(runtime_info, file, indent=2)
+
+
+# ============================================================
+# 3. RESOLVE THE FOUR EXACT FOLDERS, VALIDATE, AND DE-DUPLICATE
+# ============================================================
+
+
+def resolve_required_class_directories():
+    """Locate one and only one directory for every exact whitelisted name."""
+    progress(
+        "STAGE 2 — LOCATING DATA",
+        "Searching for the four exact CORN_* class folders",
+        include_resources=True,
+    )
+    if not DATASET_ROOT.exists():
+        raise FileNotFoundError(
+            f"Dataset not found at {DATASET_ROOT}. Attach "
+            "yasirahmad0810/consolidated-corn-dataset and run again."
+        )
+
+    resolved = {}
+    missing = []
+    ambiguous = {}
+
+    for folder_name, class_name in REQUIRED_CLASS_FOLDERS.items():
+        matches = sorted(
+            path
+            for path in DATASET_ROOT.rglob(folder_name)
+            if path.is_dir() and path.name == folder_name
+        )
+        if not matches:
+            missing.append(folder_name)
+        elif len(matches) > 1:
+            ambiguous[folder_name] = [str(path) for path in matches]
+        else:
+            resolved[class_name] = matches[0].resolve()
+
+    if missing:
+        raise RuntimeError(
+            "Required maize folder(s) not found under "
+            f"{DATASET_ROOT}: {missing}. Folder names must match exactly."
+        )
+    if ambiguous:
+        details = "\n".join(
+            f"  {name}: {paths}" for name, paths in ambiguous.items()
+        )
+        raise RuntimeError(
+            "More than one directory has a required folder name. "
+            "Set DATASET_ROOT to the parent of the intended four folders:\n"
+            f"{details}"
+        )
+
+    print("\nExact maize folders selected:")
+    for class_name in CLASS_NAMES:
+        print(f"  {class_name:18s} <- {resolved[class_name]}")
+    print("All other dataset folders will be ignored.\n")
+    return resolved
+
+
+CLASS_DIRECTORIES = resolve_required_class_directories()
+
+with (SHARED_DIR / "selected_class_folders.json").open("w") as file:
+    json.dump(
+        {
+            class_name: {
+                "folder_name": directory.name,
+                "directory": str(directory),
+            }
+            for class_name, directory in CLASS_DIRECTORIES.items()
+        },
+        file,
+        indent=2,
+    )
+
+
+RESAMPLING = getattr(Image, "Resampling", Image)
+
+
+def image_fingerprints(rgb_image):
+    """Create a normalized exact hash and a 64-bit perceptual dHash."""
+    normalized = rgb_image.resize(IMAGE_SIZE, RESAMPLING.BILINEAR)
+    pixel_hash = hashlib.sha256(np.asarray(normalized).tobytes()).hexdigest()
+
+    gray = rgb_image.convert("L").resize((9, 8), RESAMPLING.BILINEAR)
+    values = np.asarray(gray)
+    bits = values[:, 1:] > values[:, :-1]
+    bit_string = "".join("1" if bit else "0" for bit in bits.ravel())
+    perceptual_hash = f"{int(bit_string, 2):016x}"
+    return pixel_hash, perceptual_hash
+
+
+def build_clean_manifest():
+    # Scan only the four resolved directories. No other folder is traversed.
+    selected_images = []
+    folder_image_counts = {}
+    for class_name in CLASS_NAMES:
+        class_directory = CLASS_DIRECTORIES[class_name]
+        paths = sorted(
+            path
+            for path in class_directory.rglob("*")
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+        folder_image_counts[class_name] = len(paths)
+        selected_images.extend((path, class_name, class_directory) for path in paths)
+
+    empty_folders = [
+        class_name
+        for class_name, count in folder_image_counts.items()
+        if count == 0
+    ]
+    if empty_folders:
+        raise RuntimeError(
+            "No supported images were found in required class folder(s): "
+            f"{empty_folders}"
+        )
+
+    rows = []
+    skipped = {"corrupt": 0, "too_small": 0}
+    progress(
+        "STAGE 3 — CHECKING IMAGES",
+        f"Validating and fingerprinting {len(selected_images):,} images",
+        include_resources=True,
+        images_total=len(selected_images),
+    )
+    scan_start = time.perf_counter()
+
+    for number, (path, class_name, class_directory) in enumerate(
+        selected_images, 1
+    ):
+        try:
+            with Image.open(path) as image:
+                image.load()
+                rgb = image.convert("RGB")
+                if min(rgb.size) < 64:
+                    skipped["too_small"] += 1
+                    continue
+                pixel_hash, perceptual_hash = image_fingerprints(rgb)
+        except (UnidentifiedImageError, OSError, ValueError):
+            skipped["corrupt"] += 1
+            continue
+
+        rows.append(
+            {
+                "filepath": str(path),
+                "class_name": class_name,
+                "label": CLASS_TO_INDEX[class_name],
+                "source_folder": class_directory.name,
+                "source_directory": str(class_directory),
+                "pixel_hash": pixel_hash,
+                "perceptual_hash": perceptual_hash,
+            }
+        )
+
+        if (
+            number % IMAGE_SCAN_PROGRESS_EVERY == 0
+            or number == len(selected_images)
+        ):
+            rate = number / max(time.perf_counter() - scan_start, 1e-6)
+            remaining = (len(selected_images) - number) / max(rate, 1e-6)
+            progress(
+                "IMAGE SCAN",
+                f"{number:,}/{len(selected_images):,} checked "
+                f"({100 * number / len(selected_images):.1f}%); "
+                f"about {elapsed_text(remaining)} remaining",
+                include_resources=True,
+                images_checked=number,
+                images_total=len(selected_images),
+            )
+
+    data = pd.DataFrame(rows)
+    if data.empty:
+        raise RuntimeError("No usable images remained in the four required folders.")
+    data = data.sort_values("filepath").reset_index(drop=True)
+
+    # Conflicting duplicate groups are removed; same-class groups keep one copy.
+    for hash_column in ["pixel_hash", "perceptual_hash"]:
+        conflicting = (
+            data.groupby(hash_column)["class_name"].transform("nunique") > 1
+        )
+        data = data.loc[~conflicting].copy()
+        data = data.drop_duplicates(hash_column, keep="first")
+
+    counts = data["class_name"].value_counts().reindex(CLASS_NAMES, fill_value=0)
+    if (counts < 10).any():
+        raise RuntimeError(f"Insufficient images after cleaning:\n{counts}")
+
+    print("Skipped files:", skipped)
+    print("Unique usable images:", len(data))
+    print(counts)
+    return data.reset_index(drop=True)
+
+
+# ============================================================
+# 4. CREATE OR REUSE ONE STRATIFIED 70/15/15 SPLIT
+# ============================================================
+
+
+def create_split(data):
+    if not np.isclose(TRAIN_RATIO + VALID_RATIO + TEST_RATIO, 1.0):
+        raise ValueError("TRAIN_RATIO + VALID_RATIO + TEST_RATIO must equal 1")
+
+    train_valid, test = train_test_split(
+        data,
+        test_size=TEST_RATIO,
+        random_state=SEED,
+        stratify=data["label"],
+    )
+    valid_fraction = VALID_RATIO / (TRAIN_RATIO + VALID_RATIO)
+    train, valid = train_test_split(
+        train_valid,
+        test_size=valid_fraction,
+        random_state=SEED,
+        stratify=train_valid["label"],
+    )
+
+    return pd.concat(
+        [
+            train.assign(split="train"),
+            valid.assign(split="valid"),
+            test.assign(split="test"),
+        ],
+        ignore_index=True,
+    )
+
+
+def reusable_manifest_is_valid(path):
+    if not path.exists():
+        return False
+    try:
+        old = pd.read_csv(path)
+        required = {
+            "filepath",
+            "class_name",
+            "label",
+            "source_folder",
+            "source_directory",
+            "pixel_hash",
+            "perceptual_hash",
+            "split",
+        }
+        if not (
+            required.issubset(old.columns)
+            and set(old["class_name"]) == set(CLASS_NAMES)
+            and set(old["split"]) == {"train", "valid", "test"}
+            and old["filepath"].map(lambda value: Path(value).exists()).all()
+        ):
+            return False
+
+        expected_folder_for_class = {
+            class_name: directory.name
+            for class_name, directory in CLASS_DIRECTORIES.items()
+        }
+        expected_directory_for_class = {
+            class_name: directory
+            for class_name, directory in CLASS_DIRECTORIES.items()
+        }
+
+        for row in old.itertuples(index=False):
+            class_name = row.class_name
+            expected_directory = expected_directory_for_class.get(class_name)
+            if expected_directory is None:
+                return False
+            if row.source_folder != expected_folder_for_class[class_name]:
+                return False
+            if Path(row.source_directory).resolve() != expected_directory:
+                return False
+            try:
+                Path(row.filepath).resolve().relative_to(expected_directory)
+            except ValueError:
+                return False
+
+        return True
+    except Exception:
+        return False
+
+
+if REUSE_MANIFEST and reusable_manifest_is_valid(MANIFEST_PATH):
+    manifest = pd.read_csv(MANIFEST_PATH)
+    progress(
+        "STAGE 3 — DATA READY",
+        f"Reusing validated fixed split: {MANIFEST_PATH}",
+        include_resources=True,
+    )
+else:
+    manifest = create_split(build_clean_manifest())
+    manifest.to_csv(MANIFEST_PATH, index=False)
+    progress(
+        "STAGE 3 — DATA READY",
+        f"Created new fixed split: {MANIFEST_PATH}",
+        include_resources=True,
+    )
+
+train_df = manifest[manifest["split"] == "train"].reset_index(drop=True)
+valid_df = manifest[manifest["split"] == "valid"].reset_index(drop=True)
+test_df = manifest[manifest["split"] == "test"].reset_index(drop=True)
+
+split_summary = pd.crosstab(manifest["class_name"], manifest["split"])
+split_summary = split_summary.reindex(
+    index=CLASS_NAMES, columns=["train", "valid", "test"], fill_value=0
+)
+split_summary.to_csv(SHARED_DIR / "split_summary.csv")
+with (SHARED_DIR / "class_names.json").open("w") as file:
+    json.dump(CLASS_NAMES, file, indent=2)
+print("\nFixed split summary:\n", split_summary)
+
+split_plot = split_summary.plot(
+    kind="bar",
+    figsize=(9, 4.8),
+    color=["#4477AA", "#EEAA33", "#228833"],
+)
+split_plot.set(
+    xlabel="Class",
+    ylabel="Number of images",
+    title="Fixed dataset split by maize class",
+)
+split_plot.tick_params(axis="x", rotation=18)
+split_plot.legend(title="Split")
+split_figure = split_plot.get_figure()
+split_figure.tight_layout()
+for suffix in ["png", "pdf", "svg"]:
+    split_figure.savefig(
+        SHARED_DIR / f"split_distribution.{suffix}",
+        bbox_inches="tight",
+        dpi=400 if suffix == "png" else None,
+    )
+plt.close(split_figure)
+
+train_counts = train_df["label"].value_counts().sort_index()
+class_weights = {
+    index: len(train_df) / (len(CLASS_NAMES) * int(train_counts[index]))
+    for index in range(len(CLASS_NAMES))
+}
+print("Class weights:", class_weights)
+
+
+# ============================================================
+# 5. DATA PIPELINE
+# ============================================================
+
+
+def load_image(filepath, label):
+    image = tf.io.decode_image(
+        tf.io.read_file(filepath), channels=3, expand_animations=False
+    )
+    image.set_shape([None, None, 3])
+    image = tf.image.resize(image, IMAGE_SIZE, antialias=True)
+    return tf.cast(image, tf.float32), label
+
+
+def make_dataset(dataframe, batch_size, training=False):
+    dataset = tf.data.Dataset.from_tensor_slices(
+        (
+            dataframe["filepath"].astype(str).to_numpy(),
+            dataframe["label"].astype(np.int32).to_numpy(),
+        )
+    )
+    if training:
+        # This reshuffles on every epoch. Do not cache after this shuffle.
+        dataset = dataset.shuffle(
+            len(dataframe), seed=SEED, reshuffle_each_iteration=True
+        )
+    dataset = dataset.map(
+        load_image,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=True,
+    )
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+# ============================================================
+# 6. MODEL CONSTRUCTION
+# ============================================================
+
+
+def get_models_to_run():
+    if RUN_MODE == "all":
+        names = MODEL_ORDER
+    elif RUN_MODE == "single":
+        names = [SINGLE_MODEL]
+    else:
+        raise ValueError("RUN_MODE must be 'all' or 'single'")
+
+    unknown = [name for name in names if name not in MODEL_CONFIGS]
+    if unknown:
+        raise ValueError(f"Unknown model name(s): {unknown}")
+    return names
+
+
+def make_augmentation():
+    return tf.keras.Sequential(
+        [
+            layers.RandomFlip("horizontal", seed=SEED),
+            layers.RandomRotation(0.08, fill_mode="reflect", seed=SEED + 1),
+            layers.RandomZoom(0.15, fill_mode="reflect", seed=SEED + 2),
+            layers.RandomTranslation(
+                0.08, 0.08, fill_mode="reflect", seed=SEED + 3
+            ),
+            layers.RandomContrast(0.10, seed=SEED + 4),
+        ],
+        name="data_augmentation",
+    )
+
+
+def apply_preprocessing(x, model_name):
+    """Apply exactly the preprocessing expected by the selected backbone."""
+    if model_name == "MobileNetV2":
+        return tf.keras.applications.mobilenet_v2.preprocess_input(x)
+    if model_name == "ResNet50":
+        return tf.keras.applications.resnet50.preprocess_input(x)
+    if model_name in {"EfficientNetB0", "ConvNeXtTiny"}:
+        # Their default application models contain input preprocessing and
+        # expect float RGB pixels in [0, 255].
+        return x
+    raise ValueError(f"No preprocessing configured for {model_name}")
+
+
+def build_model(model_name):
+    config = MODEL_CONFIGS[model_name]
+    constructor = getattr(
+        tf.keras.applications, config["constructor_name"], None
+    )
+    if constructor is None:
+        raise RuntimeError(
+            f"{model_name} is unavailable in TensorFlow {tf.__version__}. "
+            "Use a current Kaggle TensorFlow image and restart the notebook."
+        )
+
+    inputs = tf.keras.Input(shape=(*IMAGE_SIZE, 3), name="image")
+    x = make_augmentation()(inputs)
+    x = apply_preprocessing(x, model_name)
+
+    backbone = constructor(
+        input_shape=(*IMAGE_SIZE, 3),
+        include_top=False,
+        weights="imagenet",
+    )
+    backbone.trainable = False
+
+    # training=False protects pretrained BatchNorm statistics during both
+    # frozen training and fine-tuning.
+    x = backbone(x, training=False)
+    x = layers.GlobalAveragePooling2D(
+        name="global_average_pooling"
+    )(x)
+    x = layers.Dropout(DROPOUT_RATE, name="classifier_dropout")(x)
+    outputs = layers.Dense(
+        len(CLASS_NAMES),
+        activation="softmax",
+        dtype="float32",
+        name="predictions",
+    )(x)
+
+    model = tf.keras.Model(
+        inputs,
+        outputs,
+        name=f"{model_name}_maize_classifier",
+    )
+    return model, backbone
+
+
+def compile_model(model, learning_rate):
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+
+
+def make_callbacks(
+    checkpoint_path,
+    csv_log_path,
+    model_name,
+    phase_name,
+    first_epoch,
+    total_phase_epochs,
+):
+    return [
+        EpochProgressCallback(
+            model_name,
+            phase_name,
+            first_epoch,
+            total_phase_epochs,
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            str(checkpoint_path),
+            monitor="val_loss",
+            mode="min",
+            save_best_only=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            mode="min",
+            patience=EARLY_STOPPING_PATIENCE,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            mode="min",
+            factor=0.5,
+            patience=2,
+            min_lr=1e-7,
+            verbose=1,
+        ),
+        tf.keras.callbacks.CSVLogger(str(csv_log_path), append=False),
+        tf.keras.callbacks.TerminateOnNaN(),
+    ]
+
+
+def configure_fine_tuning(backbone):
+    """Unfreeze the upper fraction while keeping BatchNorm frozen."""
+    backbone.trainable = True
+    total_layers = len(backbone.layers)
+    number_to_unfreeze = max(1, int(total_layers * FINE_TUNE_FRACTION))
+    fine_tune_start = total_layers - number_to_unfreeze
+
+    for index, layer in enumerate(backbone.layers):
+        layer.trainable = (
+            index >= fine_tune_start
+            and not isinstance(layer, layers.BatchNormalization)
+        )
+    return fine_tune_start, number_to_unfreeze
+
+
+# ============================================================
+# 7. ARCHITECTURE EXPORTS
+# ============================================================
+
+
+def shape_text(value):
+    try:
+        return str(tuple(value))
+    except Exception:
+        return str(value)
+
+
+def layer_output_shape(layer):
+    try:
+        return shape_text(layer.output.shape)
+    except Exception:
+        try:
+            return shape_text(layer.output_shape)
+        except Exception:
+            return "unknown"
+
+
+def find_backbone(model):
+    nested = [
+        layer
+        for layer in model.layers
+        if isinstance(layer, tf.keras.Model)
+        and layer.name != "data_augmentation"
+    ]
+    if not nested:
+        raise RuntimeError("Could not locate the nested backbone model.")
+    return max(nested, key=lambda layer: layer.count_params())
+
+
+def save_layer_table(layers_to_save, output_path):
+    rows = []
+    for index, layer in enumerate(layers_to_save):
+        rows.append(
+            {
+                "index": index,
+                "layer_name": layer.name,
+                "layer_type": layer.__class__.__name__,
+                "output_shape": layer_output_shape(layer),
+                "parameters": int(layer.count_params()),
+                "trainable": bool(layer.trainable),
+            }
+        )
+    pd.DataFrame(rows).to_csv(output_path, index=False)
+
+
+def save_architecture_overview(model_name, model, backbone, output_dir):
+    """Save a compact paper-ready overview of the implemented architecture."""
+    backbone_shape = layer_output_shape(backbone)
+    gap_shape = layer_output_shape(model.get_layer("global_average_pooling"))
+
+    blocks = [
+        ("Input", "224 × 224 × 3", "#DCEAF7"),
+        ("Augmentation +\npreprocessing", "training only / model-specific", "#E8E1F3"),
+        (model_name, backbone_shape.replace("None, ", ""), "#DCEFD8"),
+        ("Global average pooling\n+ dropout", gap_shape.replace("None, ", ""), "#F8E4C7"),
+        ("Softmax output", "4 maize classes", "#F5D6D6"),
+    ]
+
+    fig, ax = plt.subplots(figsize=(13, 3.2))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    x_positions = np.linspace(0.10, 0.90, len(blocks))
+    box_width, box_height = 0.16, 0.42
+
+    for index, ((title, subtitle, color), x_center) in enumerate(
+        zip(blocks, x_positions)
+    ):
+        left = x_center - box_width / 2
+        bottom = 0.30
+        rectangle = plt.Rectangle(
+            (left, bottom),
+            box_width,
+            box_height,
+            facecolor=color,
+            edgecolor="#303030",
+            linewidth=1.2,
+        )
+        ax.add_patch(rectangle)
+        ax.text(
+            x_center,
+            bottom + 0.27,
+            title,
+            ha="center",
+            va="center",
+            fontsize=10.5,
+            fontweight="bold",
+        )
+        ax.text(
+            x_center,
+            bottom + 0.10,
+            subtitle,
+            ha="center",
+            va="center",
+            fontsize=8.5,
+            color="#333333",
+        )
+        if index < len(blocks) - 1:
+            ax.annotate(
+                "",
+                xy=(x_positions[index + 1] - box_width / 2 - 0.008, 0.51),
+                xytext=(x_center + box_width / 2 + 0.008, 0.51),
+                arrowprops={"arrowstyle": "->", "lw": 1.4, "color": "#303030"},
+            )
+
+    ax.set_title(
+        f"Implemented {model_name} transfer-learning architecture",
+        fontsize=13,
+        fontweight="bold",
+        pad=8,
+    )
+    fig.tight_layout()
+    for suffix in ["svg", "pdf", "png"]:
+        fig.savefig(
+            output_dir / f"{model_name}_architecture_overview.{suffix}",
+            bbox_inches="tight",
+            dpi=400 if suffix == "png" else None,
+        )
+    plt.close(fig)
+
+
+def export_architecture(model_name, model, output_dir):
+    architecture_dir = output_dir / "architecture"
+    architecture_dir.mkdir(parents=True, exist_ok=True)
+    backbone = find_backbone(model)
+
+    with (architecture_dir / "model_summary.txt").open("w") as file:
+        try:
+            model.summary(
+                print_fn=lambda line: file.write(line + "\n"),
+                expand_nested=True,
+                show_trainable=True,
+            )
+        except TypeError:
+            model.summary(print_fn=lambda line: file.write(line + "\n"))
+
+    with (architecture_dir / "model_config.json").open("w") as file:
+        file.write(model.to_json(indent=2))
+
+    save_layer_table(model.layers, architecture_dir / "top_level_layers.csv")
+    save_layer_table(backbone.layers, architecture_dir / "backbone_layers.csv")
+
+    # This requires pydot/Graphviz, normally available in Kaggle.
+    try:
+        tf.keras.utils.plot_model(
+            model,
+            to_file=str(architecture_dir / "keras_architecture.png"),
+            show_shapes=True,
+            show_layer_names=True,
+            show_trainable=True,
+            expand_nested=False,
+            rankdir="LR",
+            dpi=220,
+        )
+    except Exception as error:
+        with (architecture_dir / "keras_plot_error.txt").open("w") as file:
+            file.write(str(error))
+
+    save_architecture_overview(
+        model_name, model, backbone, architecture_dir
+    )
+
+    info = {
+        "model": model_name,
+        "input_shape": shape_text(model.input.shape),
+        "backbone_output_shape": layer_output_shape(backbone),
+        "global_average_pooling_output_shape": layer_output_shape(
+            model.get_layer("global_average_pooling")
+        ),
+        "classifier_output_shape": layer_output_shape(
+            model.get_layer("predictions")
+        ),
+        "total_parameters": int(model.count_params()),
+        "trainable_parameters": int(
+            sum(np.prod(weight.shape) for weight in model.trainable_weights)
+        ),
+        "non_trainable_parameters": int(
+            sum(np.prod(weight.shape) for weight in model.non_trainable_weights)
+        ),
+        "pooling": "GlobalAveragePooling2D",
+        "dropout_rate": DROPOUT_RATE,
+        "classes": CLASS_NAMES,
+    }
+    with (architecture_dir / "architecture_info.json").open("w") as file:
+        json.dump(info, file, indent=2)
+    return info
+
+
+# ============================================================
+# 8. EVALUATION AND FIGURES
+# ============================================================
+
+
+def save_training_curves(model_name, history1, history2, output_dir):
+    h1, h2 = history1.history, history2.history
+    train_acc = h1["accuracy"] + h2["accuracy"]
+    valid_acc = h1["val_accuracy"] + h2["val_accuracy"]
+    train_loss = h1["loss"] + h2["loss"]
+    valid_loss = h1["val_loss"] + h2["val_loss"]
+    epochs = np.arange(1, len(train_acc) + 1)
+    phase_boundary = len(h1["accuracy"]) + 0.5
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.3))
+    axes[0].plot(epochs, train_acc, label="Training")
+    axes[0].plot(epochs, valid_acc, label="Validation")
+    axes[0].set(xlabel="Epoch", ylabel="Accuracy", title="Accuracy")
+    axes[0].legend()
+    axes[1].plot(epochs, train_loss, label="Training")
+    axes[1].plot(epochs, valid_loss, label="Validation")
+    axes[1].set(
+        xlabel="Epoch", ylabel="Loss", title="Cross-entropy loss"
+    )
+    axes[1].legend()
+    for axis in axes:
+        axis.axvline(
+            phase_boundary, color="gray", linestyle="--", linewidth=1
+        )
+    fig.suptitle(f"{model_name} training history")
+    fig.tight_layout()
+    save_figure(fig, output_dir, "training_history")
+
+
+def save_figure(fig, output_dir, stem):
+    """Save every report figure as high-resolution raster and vector files."""
+    for suffix in ["png", "pdf", "svg"]:
+        fig.savefig(
+            output_dir / f"{stem}.{suffix}",
+            bbox_inches="tight",
+            dpi=400 if suffix == "png" else None,
+        )
+    plt.close(fig)
+
+
+def per_class_diagnostics(test_labels, predictions, probabilities, cm):
+    total = cm.sum()
+    rows = []
+    for index, class_name in enumerate(CLASS_NAMES):
+        tp = float(cm[index, index])
+        fn = float(cm[index, :].sum() - tp)
+        fp = float(cm[:, index].sum() - tp)
+        tn = float(total - tp - fn - fp)
+        precision = tp / max(tp + fp, 1.0)
+        recall = tp / max(tp + fn, 1.0)
+        specificity = tn / max(tn + fp, 1.0)
+        npv = tn / max(tn + fn, 1.0)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+        binary_true = (test_labels == index).astype(int)
+        rows.append(
+            {
+                "class": class_name,
+                "support": int(tp + fn),
+                "true_positive": int(tp),
+                "false_negative": int(fn),
+                "false_positive": int(fp),
+                "true_negative": int(tn),
+                "precision_ppv": precision,
+                "recall_sensitivity": recall,
+                "specificity_tnr": specificity,
+                "f1_score": f1,
+                "negative_predictive_value": npv,
+                "false_positive_rate": fp / max(fp + tn, 1.0),
+                "false_negative_rate": fn / max(fn + tp, 1.0),
+                "one_vs_rest_accuracy": (tp + tn) / max(total, 1.0),
+                "roc_auc_ovr": roc_auc_score(
+                    binary_true, probabilities[:, index]
+                ),
+                "average_precision": average_precision_score(
+                    binary_true, probabilities[:, index]
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def expected_calibration_error(test_labels, predictions, probabilities):
+    confidence = probabilities.max(axis=1)
+    correct = (predictions == test_labels).astype(float)
+    edges = np.linspace(0.0, 1.0, CALIBRATION_BINS + 1)
+    ece = 0.0
+    rows = []
+    for lower, upper in zip(edges[:-1], edges[1:]):
+        if upper == 1.0:
+            mask = (confidence >= lower) & (confidence <= upper)
+        else:
+            mask = (confidence >= lower) & (confidence < upper)
+        count = int(mask.sum())
+        if count == 0:
+            continue
+        bin_accuracy = float(correct[mask].mean())
+        bin_confidence = float(confidence[mask].mean())
+        ece += count / len(test_labels) * abs(bin_accuracy - bin_confidence)
+        rows.append(
+            {
+                "lower_bound": lower,
+                "upper_bound": upper,
+                "samples": count,
+                "mean_confidence": bin_confidence,
+                "accuracy": bin_accuracy,
+                "calibration_gap": bin_accuracy - bin_confidence,
+            }
+        )
+    return float(ece), pd.DataFrame(rows)
+
+
+def bootstrap_confidence_intervals(test_labels, predictions, probabilities):
+    """Non-parametric 95% CIs from resampling the fixed test set."""
+    rng = np.random.default_rng(SEED)
+    samples = {
+        "test_accuracy": [],
+        "balanced_accuracy": [],
+        "macro_precision": [],
+        "macro_recall": [],
+        "macro_f1": [],
+        "macro_specificity": [],
+        "matthews_correlation_coefficient": [],
+        "cohen_kappa": [],
+        "macro_roc_auc": [],
+    }
+    sample_count = len(test_labels)
+    all_classes = np.arange(len(CLASS_NAMES))
+    for _ in range(BOOTSTRAP_REPEATS):
+        indices = rng.integers(0, sample_count, sample_count)
+        y_true = test_labels[indices]
+        y_pred = predictions[indices]
+        y_prob = probabilities[indices]
+        samples["test_accuracy"].append(accuracy_score(y_true, y_pred))
+        samples["balanced_accuracy"].append(
+            recall_score(
+                y_true,
+                y_pred,
+                labels=all_classes,
+                average="macro",
+                zero_division=0,
+            )
+        )
+        samples["macro_precision"].append(
+            precision_score(
+                y_true,
+                y_pred,
+                labels=all_classes,
+                average="macro",
+                zero_division=0,
+            )
+        )
+        samples["macro_recall"].append(
+            recall_score(
+                y_true,
+                y_pred,
+                labels=all_classes,
+                average="macro",
+                zero_division=0,
+            )
+        )
+        samples["macro_f1"].append(
+            f1_score(
+                y_true,
+                y_pred,
+                labels=all_classes,
+                average="macro",
+                zero_division=0,
+            )
+        )
+        bootstrap_cm = confusion_matrix(
+            y_true, y_pred, labels=all_classes
+        )
+        bootstrap_total = bootstrap_cm.sum()
+        bootstrap_specificities = []
+        for class_index in all_classes:
+            tp = bootstrap_cm[class_index, class_index]
+            fn = bootstrap_cm[class_index, :].sum() - tp
+            fp = bootstrap_cm[:, class_index].sum() - tp
+            tn = bootstrap_total - tp - fn - fp
+            bootstrap_specificities.append(tn / max(tn + fp, 1))
+        samples["macro_specificity"].append(
+            float(np.mean(bootstrap_specificities))
+        )
+        samples["matthews_correlation_coefficient"].append(
+            matthews_corrcoef(y_true, y_pred)
+        )
+        samples["cohen_kappa"].append(cohen_kappa_score(y_true, y_pred))
+        if len(np.unique(y_true)) == len(CLASS_NAMES):
+            bootstrap_binary = label_binarize(y_true, classes=all_classes)
+            samples["macro_roc_auc"].append(
+                roc_auc_score(
+                    bootstrap_binary,
+                    y_prob,
+                    average="macro",
+                    multi_class="ovr",
+                )
+            )
+
+    alpha = (1.0 - CONFIDENCE_LEVEL) / 2.0
+    rows = []
+    for metric_name, values in samples.items():
+        clean = np.asarray(values, dtype=float)
+        clean = clean[np.isfinite(clean)]
+        rows.append(
+            {
+                "metric": metric_name,
+                "confidence_level": CONFIDENCE_LEVEL,
+                "bootstrap_repeats": len(clean),
+                "lower": float(np.quantile(clean, alpha)),
+                "median": float(np.quantile(clean, 0.5)),
+                "upper": float(np.quantile(clean, 1.0 - alpha)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def benchmark_model(model, test_ds):
+    """Benchmark already-decoded tensors so storage speed is not measured."""
+    batch_images, _ = next(iter(test_ds))
+    single_image = batch_images[:1]
+
+    for _ in range(5):
+        model(batch_images, training=False).numpy()
+        model(single_image, training=False).numpy()
+
+    batch_times = []
+    single_times = []
+    for _ in range(BENCHMARK_REPEATS):
+        start = time.perf_counter()
+        model(batch_images, training=False).numpy()
+        batch_times.append(time.perf_counter() - start)
+
+        start = time.perf_counter()
+        model(single_image, training=False).numpy()
+        single_times.append(time.perf_counter() - start)
+
+    batch_size = int(batch_images.shape[0])
+    median_batch_seconds = float(np.median(batch_times))
+    median_single_seconds = float(np.median(single_times))
+    return {
+        "benchmark_device": "GPU" if GPUS else "CPU",
+        "benchmark_repeats": BENCHMARK_REPEATS,
+        "benchmark_batch_size": batch_size,
+        "median_batch_latency_ms": median_batch_seconds * 1000.0,
+        "median_latency_per_image_in_batch_ms": (
+            median_batch_seconds * 1000.0 / batch_size
+        ),
+        "median_single_image_latency_ms": median_single_seconds * 1000.0,
+        "batch_throughput_images_per_second": (
+            batch_size / median_batch_seconds
+        ),
+    }
+
+
+def plot_roc_curves(model_name, test_labels, probabilities, output_dir):
+    binary_labels = label_binarize(
+        test_labels, classes=range(len(CLASS_NAMES))
+    )
+    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+    all_fpr = []
+    class_curves = []
+    for index, class_name in enumerate(CLASS_NAMES):
+        fpr, tpr, _ = roc_curve(binary_labels[:, index], probabilities[:, index])
+        class_auc = auc(fpr, tpr)
+        class_curves.append((fpr, tpr))
+        all_fpr.append(fpr)
+        ax.plot(fpr, tpr, lw=1.8, label=f"{class_name} (AUC={class_auc:.3f})")
+
+    common_fpr = np.unique(np.concatenate(all_fpr))
+    mean_tpr = np.mean(
+        [np.interp(common_fpr, fpr, tpr) for fpr, tpr in class_curves],
+        axis=0,
+    )
+    macro_auc = auc(common_fpr, mean_tpr)
+    micro_fpr, micro_tpr, _ = roc_curve(binary_labels.ravel(), probabilities.ravel())
+    ax.plot(
+        common_fpr,
+        mean_tpr,
+        color="black",
+        lw=2.4,
+        linestyle="--",
+        label=f"Macro average (AUC={macro_auc:.3f})",
+    )
+    ax.plot(
+        micro_fpr,
+        micro_tpr,
+        color="#666666",
+        lw=2.0,
+        linestyle=":",
+        label=f"Micro average (AUC={auc(micro_fpr, micro_tpr):.3f})",
+    )
+    ax.plot([0, 1], [0, 1], color="gray", linestyle="--", linewidth=1)
+    ax.set(
+        xlabel="False-positive rate",
+        ylabel="True-positive rate",
+        title=f"{model_name} one-vs-rest ROC curves — test set",
+        xlim=(0, 1),
+        ylim=(0, 1.02),
+    )
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    save_figure(fig, output_dir, "roc_curves")
+
+
+def plot_precision_recall_curves(
+    model_name, test_labels, probabilities, output_dir
+):
+    binary_labels = label_binarize(
+        test_labels, classes=range(len(CLASS_NAMES))
+    )
+    fig, ax = plt.subplots(figsize=(7.2, 6.2))
+    for index, class_name in enumerate(CLASS_NAMES):
+        precision, recall, _ = precision_recall_curve(
+            binary_labels[:, index], probabilities[:, index]
+        )
+        ap = average_precision_score(
+            binary_labels[:, index], probabilities[:, index]
+        )
+        ax.plot(recall, precision, lw=1.8, label=f"{class_name} (AP={ap:.3f})")
+    micro_precision, micro_recall, _ = precision_recall_curve(
+        binary_labels.ravel(), probabilities.ravel()
+    )
+    micro_ap = average_precision_score(
+        binary_labels, probabilities, average="micro"
+    )
+    ax.plot(
+        micro_recall,
+        micro_precision,
+        color="black",
+        linestyle="--",
+        lw=2.4,
+        label=f"Micro average (AP={micro_ap:.3f})",
+    )
+    prevalence = 1.0 / len(CLASS_NAMES)
+    ax.axhline(prevalence, color="gray", linestyle=":", linewidth=1)
+    ax.set(
+        xlabel="Recall",
+        ylabel="Precision",
+        title=f"{model_name} precision–recall curves — test set",
+        xlim=(0, 1),
+        ylim=(0, 1.02),
+    )
+    ax.legend(fontsize=8, loc="lower left")
+    fig.tight_layout()
+    save_figure(fig, output_dir, "precision_recall_curves")
+
+
+def plot_calibration(model_name, test_labels, probabilities, output_dir):
+    fig, ax = plt.subplots(figsize=(7.0, 6.0))
+    bin_edges = np.linspace(0.0, 1.0, CALIBRATION_BINS + 1)
+    for index, class_name in enumerate(CLASS_NAMES):
+        binary_true = (test_labels == index).astype(float)
+        confidence = probabilities[:, index]
+        means, fractions = [], []
+        for lower, upper in zip(bin_edges[:-1], bin_edges[1:]):
+            mask = (confidence >= lower) & (
+                confidence <= upper if upper == 1.0 else confidence < upper
+            )
+            if mask.any():
+                means.append(float(confidence[mask].mean()))
+                fractions.append(float(binary_true[mask].mean()))
+        ax.plot(means, fractions, marker="o", lw=1.5, label=class_name)
+    ax.plot([0, 1], [0, 1], color="black", linestyle="--", label="Perfect")
+    ax.set(
+        xlabel="Mean predicted probability",
+        ylabel="Observed frequency",
+        title=f"{model_name} calibration curves — test set",
+        xlim=(0, 1),
+        ylim=(0, 1),
+    )
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    save_figure(fig, output_dir, "calibration_curves")
+
+
+def plot_confidence_analysis(
+    model_name, test_labels, predictions, probabilities, output_dir
+):
+    confidence = probabilities.max(axis=1)
+    correct = predictions == test_labels
+    order = np.argsort(-confidence)
+    cumulative_accuracy = np.cumsum(correct[order]) / np.arange(1, len(order) + 1)
+    coverage = np.arange(1, len(order) + 1) / len(order)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.3))
+    axes[0].hist(
+        confidence[correct], bins=15, alpha=0.70, label="Correct", color="#228833"
+    )
+    axes[0].hist(
+        confidence[~correct], bins=15, alpha=0.70, label="Incorrect", color="#CC3311"
+    )
+    axes[0].set(xlabel="Maximum softmax probability", ylabel="Images", title="Confidence distribution")
+    axes[0].legend()
+    axes[1].plot(coverage, cumulative_accuracy, color="#4477AA", lw=2)
+    axes[1].set(
+        xlabel="Coverage (most-confident images retained)",
+        ylabel="Accuracy",
+        title="Risk–coverage behavior",
+        xlim=(0, 1),
+        ylim=(0, 1.02),
+    )
+    fig.suptitle(f"{model_name} confidence analysis — test set")
+    fig.tight_layout()
+    save_figure(fig, output_dir, "confidence_analysis")
+
+
+def plot_misclassified_examples(
+    model_name, predictions_table, output_dir
+):
+    errors = predictions_table[
+        predictions_table["label"] != predictions_table["predicted_label"]
+    ].sort_values("prediction_confidence", ascending=False)
+    errors.to_csv(output_dir / "misclassified_predictions.csv", index=False)
+    if errors.empty:
+        (output_dir / "misclassified_examples.txt").write_text(
+            "No test images were misclassified.\n"
+        )
+        return
+
+    shown = errors.head(MAX_ERROR_EXAMPLES)
+    columns = 4
+    rows = int(np.ceil(len(shown) / columns))
+    fig, axes = plt.subplots(rows, columns, figsize=(12, 3.25 * rows))
+    axes = np.atleast_1d(axes).ravel()
+    for axis, (_, item) in zip(axes, shown.iterrows()):
+        with Image.open(item["filepath"]) as image:
+            axis.imshow(image.convert("RGB"))
+        axis.set_title(
+            f"True: {item['class_name']}\nPred: {item['predicted_class']} "
+            f"({item['prediction_confidence']:.2f})",
+            fontsize=8,
+        )
+        axis.axis("off")
+    for axis in axes[len(shown):]:
+        axis.axis("off")
+    fig.suptitle(f"{model_name}: highest-confidence test errors", fontsize=13)
+    fig.tight_layout()
+    save_figure(fig, output_dir, "misclassified_examples")
+
+
+def evaluate_and_save(
+    model_name,
+    model,
+    test_ds,
+    selected_phase,
+    history1,
+    history2,
+    output_dir,
+):
+    progress(
+        "EVALUATION",
+        f"{model_name}: predicting the untouched test set",
+        include_resources=True,
+        model=model_name,
+    )
+    test_labels = test_df["label"].to_numpy()
+    probabilities = model.predict(test_ds, verbose=1)
+    predictions = np.argmax(probabilities, axis=1)
+    binary_labels = label_binarize(
+        test_labels, classes=range(len(CLASS_NAMES))
+    )
+
+    cm = confusion_matrix(
+        test_labels, predictions, labels=range(len(CLASS_NAMES))
+    )
+    class_metrics = per_class_diagnostics(
+        test_labels, predictions, probabilities, cm
+    )
+    class_metrics.to_csv(output_dir / "per_class_metrics.csv", index=False)
+
+    ece, calibration_table = expected_calibration_error(
+        test_labels, predictions, probabilities
+    )
+    calibration_table.to_csv(output_dir / "calibration_bins.csv", index=False)
+
+    progress(
+        "EVALUATION",
+        f"{model_name}: calculating metrics and benchmarking inference",
+        include_resources=True,
+        model=model_name,
+    )
+    benchmark = benchmark_model(model, test_ds)
+    model_path = output_dir / f"{model_name}_best.keras"
+    if model_path.is_dir():
+        model_size_bytes = sum(
+            path.stat().st_size for path in model_path.rglob("*") if path.is_file()
+        )
+    else:
+        model_size_bytes = model_path.stat().st_size
+
+    one_hot_labels = np.eye(len(CLASS_NAMES), dtype=np.float32)[test_labels]
+    macro_specificity = float(class_metrics["specificity_tnr"].mean())
+
+    metrics = {
+        "model": model_name,
+        "selected_phase": selected_phase,
+        "test_loss": float(
+            log_loss(
+                test_labels,
+                probabilities,
+                labels=range(len(CLASS_NAMES)),
+            )
+        ),
+        "test_accuracy": float(accuracy_score(test_labels, predictions)),
+        "top_2_accuracy": float(
+            top_k_accuracy_score(
+                test_labels,
+                probabilities,
+                k=2,
+                labels=range(len(CLASS_NAMES)),
+            )
+        ),
+        "balanced_accuracy": float(
+            balanced_accuracy_score(test_labels, predictions)
+        ),
+        "macro_precision": float(
+            precision_score(
+                test_labels, predictions, average="macro", zero_division=0
+            )
+        ),
+        "macro_recall": float(
+            recall_score(
+                test_labels, predictions, average="macro", zero_division=0
+            )
+        ),
+        "macro_f1": float(
+            f1_score(
+                test_labels, predictions, average="macro", zero_division=0
+            )
+        ),
+        "weighted_precision": float(
+            precision_score(
+                test_labels, predictions, average="weighted", zero_division=0
+            )
+        ),
+        "weighted_recall": float(
+            recall_score(
+                test_labels, predictions, average="weighted", zero_division=0
+            )
+        ),
+        "weighted_f1": float(
+            f1_score(
+                test_labels, predictions, average="weighted", zero_division=0
+            )
+        ),
+        "macro_specificity": macro_specificity,
+        "matthews_correlation_coefficient": float(
+            matthews_corrcoef(test_labels, predictions)
+        ),
+        "cohen_kappa": float(cohen_kappa_score(test_labels, predictions)),
+        "macro_roc_auc": float(
+            roc_auc_score(
+                binary_labels,
+                probabilities,
+                average="macro",
+                multi_class="ovr",
+            )
+        ),
+        "weighted_roc_auc": float(
+            roc_auc_score(
+                binary_labels,
+                probabilities,
+                average="weighted",
+                multi_class="ovr",
+            )
+        ),
+        "micro_roc_auc": float(
+            auc(
+                *roc_curve(
+                    binary_labels.ravel(), probabilities.ravel()
+                )[:2]
+            )
+        ),
+        "macro_average_precision": float(
+            average_precision_score(binary_labels, probabilities, average="macro")
+        ),
+        "micro_average_precision": float(
+            average_precision_score(binary_labels, probabilities, average="micro")
+        ),
+        "multiclass_brier_score": float(
+            np.mean(np.sum((probabilities - one_hot_labels) ** 2, axis=1))
+        ),
+        "expected_calibration_error": ece,
+        "mean_prediction_confidence": float(probabilities.max(axis=1).mean()),
+        "test_images": int(len(test_df)),
+        "model_size_bytes": int(model_size_bytes),
+        "model_size_mb": float(model_size_bytes / (1024 ** 2)),
+        **benchmark,
+    }
+
+    report = classification_report(
+        test_labels,
+        predictions,
+        labels=range(len(CLASS_NAMES)),
+        target_names=CLASS_NAMES,
+        digits=4,
+        zero_division=0,
+    )
+    report_dict = classification_report(
+        test_labels,
+        predictions,
+        labels=range(len(CLASS_NAMES)),
+        target_names=CLASS_NAMES,
+        output_dict=True,
+        zero_division=0,
+    )
+    with (output_dir / "classification_report.txt").open("w") as file:
+        file.write(report)
+    pd.DataFrame(report_dict).transpose().to_csv(
+        output_dir / "classification_report.csv"
+    )
+
+    predictions_table = test_df[["filepath", "class_name", "label"]].copy()
+    predictions_table["predicted_label"] = predictions
+    predictions_table["predicted_class"] = [
+        CLASS_NAMES[index] for index in predictions
+    ]
+    predictions_table["prediction_confidence"] = probabilities.max(axis=1)
+    predictions_table["correct"] = predictions == test_labels
+    for class_index, class_name in enumerate(CLASS_NAMES):
+        predictions_table[f"probability_{class_name}"] = probabilities[
+            :, class_index
+        ]
+    predictions_table.to_csv(output_dir / "test_predictions.csv", index=False)
+
+    pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES).to_csv(
+        output_dir / "confusion_matrix.csv"
+    )
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        cbar=False,
+        square=True,
+        xticklabels=CLASS_NAMES,
+        yticklabels=CLASS_NAMES,
+        ax=ax,
+    )
+    ax.set(xlabel="Predicted class", ylabel="True class")
+    ax.set_title(f"{model_name} confusion matrix — test set")
+    ax.tick_params(axis="x", rotation=25)
+    ax.tick_params(axis="y", rotation=0)
+    fig.tight_layout()
+    save_figure(fig, output_dir, "confusion_matrix")
+
+    normalized_cm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sns.heatmap(
+        normalized_cm,
+        annot=True,
+        fmt=".2%",
+        cmap="Blues",
+        cbar=True,
+        square=True,
+        vmin=0,
+        vmax=1,
+        xticklabels=CLASS_NAMES,
+        yticklabels=CLASS_NAMES,
+        ax=ax,
+    )
+    ax.set(xlabel="Predicted class", ylabel="True class")
+    ax.set_title(f"{model_name} normalized confusion matrix — test set")
+    ax.tick_params(axis="x", rotation=25)
+    ax.tick_params(axis="y", rotation=0)
+    fig.tight_layout()
+    save_figure(fig, output_dir, "confusion_matrix_normalized")
+
+    plotted_metrics = {
+        "Precision": class_metrics["precision_ppv"].to_numpy(),
+        "Recall": class_metrics["recall_sensitivity"].to_numpy(),
+        "Specificity": class_metrics["specificity_tnr"].to_numpy(),
+        "F1-score": class_metrics["f1_score"].to_numpy(),
+    }
+    x = np.arange(len(CLASS_NAMES))
+    width = 0.19
+    fig, ax = plt.subplots(figsize=(10, 5.2))
+    for offset, (label, values) in enumerate(plotted_metrics.items()):
+        ax.bar(x + (offset - 1.5) * width, values, width, label=label)
+    ax.set_xticks(x, CLASS_NAMES)
+    ax.set(ylabel="Score", ylim=(0, 1.06))
+    ax.set_title(f"{model_name} per-class performance — test set")
+    ax.tick_params(axis="x", rotation=20)
+    ax.legend(ncol=4, fontsize=8)
+    fig.tight_layout()
+    save_figure(fig, output_dir, "per_class_metrics")
+
+    progress(
+        "EVALUATION",
+        f"{model_name}: drawing diagnostic plots",
+        include_resources=True,
+        model=model_name,
+    )
+    plot_roc_curves(model_name, test_labels, probabilities, output_dir)
+    plot_precision_recall_curves(
+        model_name, test_labels, probabilities, output_dir
+    )
+    plot_calibration(model_name, test_labels, probabilities, output_dir)
+    plot_confidence_analysis(
+        model_name, test_labels, predictions, probabilities, output_dir
+    )
+    plot_misclassified_examples(model_name, predictions_table, output_dir)
+
+    progress(
+        "EVALUATION",
+        f"{model_name}: running {BOOTSTRAP_REPEATS:,} bootstrap repeats",
+        include_resources=True,
+        model=model_name,
+    )
+    confidence_intervals = bootstrap_confidence_intervals(
+        test_labels, predictions, probabilities
+    )
+    confidence_intervals.to_csv(
+        output_dir / "bootstrap_95pct_confidence_intervals.csv", index=False
+    )
+    point_values = {
+        row.metric: metrics.get(row.metric, row.median)
+        for row in confidence_intervals.itertuples()
+    }
+    ci_plot = confidence_intervals.copy()
+    ci_plot["point"] = ci_plot["metric"].map(point_values)
+    ci_plot["point"] = np.clip(
+        ci_plot["point"], ci_plot["lower"], ci_plot["upper"]
+    )
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    positions = np.arange(len(ci_plot))
+    ax.errorbar(
+        ci_plot["point"],
+        positions,
+        xerr=np.vstack(
+            [
+                ci_plot["point"] - ci_plot["lower"],
+                ci_plot["upper"] - ci_plot["point"],
+            ]
+        ),
+        fmt="o",
+        color="#4477AA",
+        ecolor="#999999",
+        capsize=4,
+    )
+    ax.set_yticks(positions, ci_plot["metric"].str.replace("_", " "))
+    ax.set(
+        xlabel=f"Score ({CONFIDENCE_LEVEL:.0%} bootstrap CI)",
+        xlim=(-0.10, 1.02),
+    )
+    ax.set_title(f"{model_name} metric uncertainty — test set")
+    fig.tight_layout()
+    save_figure(fig, output_dir, "bootstrap_confidence_intervals")
+
+    save_training_curves(
+        model_name, history1, history2, output_dir
+    )
+
+    with (output_dir / "test_metrics.json").open("w") as file:
+        json.dump(metrics, file, indent=2)
+    print("\nFINAL TEST METRICS")
+    print(json.dumps(metrics, indent=2))
+    print("\nCLASSIFICATION REPORT\n", report)
+    progress(
+        "EVALUATION COMPLETE",
+        f"{model_name}: accuracy={metrics['test_accuracy']:.4f}, "
+        f"macro_F1={metrics['macro_f1']:.4f}; results={output_dir}",
+        include_resources=True,
+        model=model_name,
+    )
+    return metrics
+
+
+# ============================================================
+# 9. TRAIN ONE SELECTED BACKBONE
+# ============================================================
+
+
+def validation_loss(checkpoint_path, valid_ds, model_name, phase_name):
+    progress(
+        "CHECKPOINT REVIEW",
+        f"{model_name}: measuring validation loss for {phase_name}",
+        include_resources=True,
+        model=model_name,
+    )
+    candidate = tf.keras.models.load_model(
+        str(checkpoint_path), compile=False
+    )
+    probabilities = candidate.predict(valid_ds, verbose=0)
+    value = log_loss(
+        valid_df["label"].to_numpy(),
+        probabilities,
+        labels=range(len(CLASS_NAMES)),
+    )
+    del candidate
+    gc.collect()
+    return float(value)
+
+
+def train_one_model(model_name, model_number, total_models):
+    model_start = time.perf_counter()
+    progress(
+        f"STAGE 4 — MODEL {model_number}/{total_models}",
+        f"Starting {model_name}",
+        include_resources=True,
+        model=model_name,
+        model_number=model_number,
+        total_models=total_models,
+    )
+
+    tf.keras.backend.clear_session()
+    gc.collect()
+    seed_everything()
+
+    config = MODEL_CONFIGS[model_name]
+    batch_size = config["batch_size"]
+    output_dir = WORK_ROOT / model_name
+    checkpoint_dir = output_dir / "checkpoints"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    phase1_path = checkpoint_dir / f"{model_name}_phase1_best.keras"
+    phase2_path = checkpoint_dir / f"{model_name}_phase2_best.keras"
+    best_model_path = output_dir / f"{model_name}_best.keras"
+
+    progress(
+        "DATA PIPELINE",
+        f"{model_name}: building train/validation/test pipelines; "
+        f"batch size={batch_size}",
+        include_resources=True,
+        model=model_name,
+    )
+    train_ds = make_dataset(train_df, batch_size, training=True)
+    valid_ds = make_dataset(valid_df, batch_size)
+    test_ds = make_dataset(test_df, batch_size)
+
+    progress(
+        "MODEL BUILD",
+        f"{model_name}: creating backbone and loading ImageNet weights",
+        include_resources=True,
+        model=model_name,
+    )
+    model, backbone = build_model(model_name)
+    compile_model(model, LEARNING_RATE_PHASE1)
+    progress(
+        "MODEL READY",
+        f"{model_name}: {model.count_params():,} total parameters; "
+        f"{sum(np.prod(weight.shape) for weight in model.trainable_weights):,} "
+        "trainable parameters",
+        include_resources=True,
+        model=model_name,
+    )
+
+    progress(
+        "PHASE 1",
+        f"{model_name}: frozen-backbone training for up to "
+        f"{EPOCHS_PHASE1} epochs",
+        include_resources=True,
+        model=model_name,
+    )
+    history1 = model.fit(
+        train_ds,
+        validation_data=valid_ds,
+        epochs=EPOCHS_PHASE1,
+        class_weight=class_weights,
+        callbacks=make_callbacks(
+            phase1_path,
+            output_dir / "phase1_log.csv",
+            model_name,
+            "phase 1 frozen backbone",
+            0,
+            EPOCHS_PHASE1,
+        ),
+        verbose=1,
+    )
+    with (output_dir / "history_phase1.json").open("w") as file:
+        json.dump(history1.history, file, indent=2)
+
+    fine_tune_start, number_unfrozen = configure_fine_tuning(backbone)
+    compile_model(model, LEARNING_RATE_PHASE2)
+    phase1_epochs_completed = len(history1.epoch)
+    progress(
+        "PHASE 2",
+        f"{model_name}: fine-tuning the upper {number_unfrozen} of "
+        f"{len(backbone.layers)} backbone layers "
+        f"(starting at index {fine_tune_start}) for up to "
+        f"{EPOCHS_PHASE2} epochs",
+        include_resources=True,
+        model=model_name,
+    )
+    history2 = model.fit(
+        train_ds,
+        validation_data=valid_ds,
+        initial_epoch=phase1_epochs_completed,
+        epochs=phase1_epochs_completed + EPOCHS_PHASE2,
+        class_weight=class_weights,
+        callbacks=make_callbacks(
+            phase2_path,
+            output_dir / "phase2_log.csv",
+            model_name,
+            "phase 2 fine-tuning",
+            phase1_epochs_completed,
+            EPOCHS_PHASE2,
+        ),
+        verbose=1,
+    )
+    with (output_dir / "history_phase2.json").open("w") as file:
+        json.dump(history2.history, file, indent=2)
+
+    del model, backbone
+    gc.collect()
+    tf.keras.backend.clear_session()
+
+    phase1_val_loss = validation_loss(
+        phase1_path, valid_ds, model_name, "phase 1"
+    )
+    phase2_val_loss = validation_loss(
+        phase2_path, valid_ds, model_name, "phase 2"
+    )
+    if phase2_val_loss < phase1_val_loss:
+        selected_path = phase2_path
+        selected_phase = "fine-tuned"
+    else:
+        selected_path = phase1_path
+        selected_phase = "frozen-backbone"
+
+    selection = {
+        "phase1_validation_loss": phase1_val_loss,
+        "phase2_validation_loss": phase2_val_loss,
+        "selected_phase": selected_phase,
+        "fine_tune_start_index": fine_tune_start,
+        "fine_tuned_backbone_layers": number_unfrozen,
+    }
+    with (output_dir / "checkpoint_selection.json").open("w") as file:
+        json.dump(selection, file, indent=2)
+    print("\nCheckpoint selection:", selection)
+
+    progress(
+        "BEST MODEL SELECTED",
+        f"{model_name}: selected {selected_phase}; saving {best_model_path}",
+        include_resources=True,
+        model=model_name,
+    )
+    best_model = tf.keras.models.load_model(
+        str(selected_path), compile=False
+    )
+    best_model.save(str(best_model_path))
+    metrics = evaluate_and_save(
+        model_name,
+        best_model,
+        test_ds,
+        selected_phase,
+        history1,
+        history2,
+        output_dir,
+    )
+
+    # Architecture is taken directly from the trained, selected model.
+    progress(
+        "ARCHITECTURE EXPORT",
+        f"{model_name}: exporting exact implemented architecture",
+        include_resources=True,
+        model=model_name,
+    )
+    architecture_info = export_architecture(
+        model_name, best_model, output_dir
+    )
+
+    result = {
+        **metrics,
+        **{
+            "batch_size": batch_size,
+            "backbone_output_shape": architecture_info[
+                "backbone_output_shape"
+            ],
+            "pooled_output_shape": architecture_info[
+                "global_average_pooling_output_shape"
+            ],
+            "total_parameters": architecture_info["total_parameters"],
+            "best_model_path": str(best_model_path),
+        },
+    }
+
+    del best_model, train_ds, valid_ds, test_ds
+    gc.collect()
+    tf.keras.backend.clear_session()
+    progress(
+        "MODEL COMPLETE",
+        f"{model_name} finished in "
+        f"{elapsed_text(time.perf_counter() - model_start)}; "
+        f"outputs={output_dir}",
+        include_resources=True,
+        model=model_name,
+    )
+    return result
+
+
+# ============================================================
+# 10. RUN MODELS, THEN SAVE COMPARISON + ARCHITECTURES
+# ============================================================
+
+
+sns.set_theme(style="whitegrid", context="paper")
+plt.rcParams["savefig.dpi"] = 300
+plt.rcParams["svg.fonttype"] = "none"
+
+models_to_run = get_models_to_run()
+progress(
+    "TRAINING QUEUE",
+    f"Models selected in order: {models_to_run}",
+    include_resources=True,
+    models=models_to_run,
+)
+
+all_results = []
+failed_models = []
+for model_number, selected_model in enumerate(models_to_run, start=1):
+    try:
+        all_results.append(
+            train_one_model(selected_model, model_number, len(models_to_run))
+        )
+    except Exception as error:
+        failure_directory = WORK_ROOT / selected_model
+        failure_directory.mkdir(parents=True, exist_ok=True)
+        traceback_text = traceback.format_exc()
+        (failure_directory / "failure_traceback.txt").write_text(
+            traceback_text, encoding="utf-8"
+        )
+        failed_models.append(
+            {
+                "model": selected_model,
+                "error": repr(error),
+                "traceback_file": str(
+                    failure_directory / "failure_traceback.txt"
+                ),
+            }
+        )
+        progress(
+            "MODEL FAILED",
+            f"{selected_model}: {error!r}; full traceback saved to "
+            f"{failure_directory / 'failure_traceback.txt'}",
+            include_resources=True,
+            model=selected_model,
+            error=repr(error),
+        )
+        if RUN_MODE == "single":
+            raise
+
+if not all_results:
+    raise RuntimeError(f"No model completed successfully: {failed_models}")
+
+comparison = pd.DataFrame(all_results).sort_values(
+    "macro_f1", ascending=False
+)
+comparison.to_csv(WORK_ROOT / "model_comparison.csv", index=False)
+with (WORK_ROOT / "model_comparison.json").open("w") as file:
+    json.dump(all_results, file, indent=2)
+with (WORK_ROOT / "failed_models.json").open("w") as file:
+    json.dump(failed_models, file, indent=2)
+
+# Report-ready cross-model predictive-performance comparison.
+comparison_metrics = [
+    "test_accuracy",
+    "balanced_accuracy",
+    "macro_precision",
+    "macro_recall",
+    "macro_specificity",
+    "macro_f1",
+    "macro_roc_auc",
+]
+comparison_long = comparison.melt(
+    id_vars="model",
+    value_vars=comparison_metrics,
+    var_name="metric",
+    value_name="score",
+)
+fig, ax = plt.subplots(figsize=(13, 5.8))
+sns.barplot(data=comparison_long, x="metric", y="score", hue="model", ax=ax)
+ax.set(
+    xlabel="Metric",
+    ylabel="Score",
+    ylim=(0, 1.05),
+    title="Test-set performance comparison",
+)
+ax.set_xticklabels(
+    [label.get_text().replace("_", " ") for label in ax.get_xticklabels()],
+    rotation=24,
+    ha="right",
+)
+ax.legend(title="Backbone", bbox_to_anchor=(1.02, 1), loc="upper left")
+fig.tight_layout()
+save_figure(fig, WORK_ROOT, "model_performance_comparison")
+
+# Accuracy/efficiency trade-offs for deployment decisions.
+fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.6))
+efficiency_panels = [
+    ("total_parameters", "Parameters (millions)"),
+    ("model_size_mb", "Saved model size (MB)"),
+    ("median_single_image_latency_ms", "Median single-image latency (ms)"),
+]
+for axis, (column, xlabel) in zip(axes, efficiency_panels):
+    x_values = comparison[column].to_numpy(dtype=float)
+    if column == "total_parameters":
+        x_values = x_values / 1_000_000.0
+    axis.scatter(x_values, comparison["macro_f1"], s=85, color="#4477AA")
+    for x_value, y_value, name in zip(
+        x_values, comparison["macro_f1"], comparison["model"]
+    ):
+        axis.annotate(name, (x_value, y_value), xytext=(4, 5), textcoords="offset points", fontsize=8)
+    axis.set(xlabel=xlabel, ylabel="Macro F1-score", ylim=(0, 1.02))
+fig.suptitle("Accuracy–efficiency trade-offs on the Kaggle GPU")
+fig.tight_layout()
+save_figure(fig, WORK_ROOT, "model_efficiency_comparison")
+
+ranking_columns = [
+    "model",
+    "test_accuracy",
+    "balanced_accuracy",
+    "macro_f1",
+    "macro_roc_auc",
+    "model_size_mb",
+    "median_single_image_latency_ms",
+    "batch_throughput_images_per_second",
+    "total_parameters",
+]
+comparison[ranking_columns].to_csv(
+    WORK_ROOT / "paper_results_table.csv", index=False
+)
+
+print("\n" + "=" * 72)
+print("FINAL MODEL COMPARISON")
+print("=" * 72)
+print(
+    comparison[
+        [
+            "model",
+            "selected_phase",
+            "test_accuracy",
+            "balanced_accuracy",
+            "macro_precision",
+            "macro_recall",
+            "macro_specificity",
+            "macro_f1",
+            "macro_roc_auc",
+            "matthews_correlation_coefficient",
+            "cohen_kappa",
+            "model_size_mb",
+            "median_single_image_latency_ms",
+            "total_parameters",
+        ]
+    ].to_string(index=False)
+)
+
+print("\nIMPLEMENTED ARCHITECTURES")
+for result in all_results:
+    print(
+        f"{result['model']}: 224x224x3 -> augmentation/preprocessing -> "
+        f"{result['backbone_output_shape']} -> GlobalAveragePooling2D "
+        f"{result['pooled_output_shape']} -> Dropout({DROPOUT_RATE}) -> "
+        f"Dense(4, softmax)"
+    )
+
+zip_path = shutil.make_archive(
+    "/kaggle/working/maize_four_backbones_results",
+    "zip",
+    root_dir=WORK_ROOT,
+)
+
+progress(
+    "ALL WORK COMPLETE",
+    f"Completed {len(all_results)}/{len(models_to_run)} models; "
+    f"archive={zip_path}",
+    include_resources=True,
+    completed_models=[result["model"] for result in all_results],
+    failed_models=failed_models,
+    archive=zip_path,
+)
+
+print("\nShared split manifest:", MANIFEST_PATH)
+print("Live status file:", STATUS_PATH)
+print("Full progress log:", PROGRESS_LOG_PATH)
+print("Comparison table:", WORK_ROOT / "model_comparison.csv")
+print("Architecture folders: <model>/architecture/")
+print("Downloadable archive:", zip_path)
+print("Training and architecture export completed.")
