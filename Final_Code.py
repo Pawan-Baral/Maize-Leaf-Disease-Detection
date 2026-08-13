@@ -78,7 +78,7 @@ tf.random.set_seed(SEED)
 
 # Automatically locate the input dataset folder under Kaggle's input path
 KAGGLE_INPUT_ROOT = "/kaggle/input"
-DATASET_PATH = None
+DATASET_PATH = None  #Put your dataset path here
 
 if os.path.exists(KAGGLE_INPUT_ROOT):
     available_folders = os.listdir(KAGGLE_INPUT_ROOT)
