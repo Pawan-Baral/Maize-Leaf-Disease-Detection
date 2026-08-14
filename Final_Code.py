@@ -36,7 +36,7 @@ if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"✅ GPU Memory Growth Enabled for {len(gpus)} GPU(s)")
+        print(f" GPU Memory Growth Enabled for {len(gpus)} GPU(s)")
     except RuntimeError as e:
         print(e)
 
@@ -118,7 +118,7 @@ def clean_and_split(dataset_path, name_map, classes, split_path, ratios, seed):
     seen, removed = set(), 0
     totals = {s: 0 for s in splits}
 
-    print("\n📂 Cleaning and splitting dataset...\n")
+    print("\n Cleaning and splitting dataset...\n")
 
     for folder in os.listdir(dataset_path):
         if folder not in name_map:
@@ -167,7 +167,7 @@ def clean_and_split(dataset_path, name_map, classes, split_path, ratios, seed):
         print(f"   {standard:<20} train={len(split_files['train'])}  valid={len(split_files['valid'])}  test={len(split_files['test'])}")
 
     print(f"\n   Removed (corrupt/duplicate): {removed}")
-    print(f"\n📊 Final split totals:")
+    print(f"\n Final split totals:")
     print(f"   Train : {totals['train']} images ({int(ratios[0]*100)}%)")
     print(f"   Valid : {totals['valid']} images ({int(ratios[1]*100)}%)")
     print(f"   Test  : {totals['test']} images ({int(ratios[2]*100)}%)\n")
@@ -180,14 +180,14 @@ if not os.path.exists(SPLIT_PATH):
         SPLIT_PATH, [TRAIN_RATIO, VALID_RATIO, TEST_RATIO], SEED
     )
 else:
-    print("✅ Split data already exists — skipping re-splitting.\n")
+    print(" Split data already exists — skipping re-splitting.\n")
 
 
 # ============================================================
 #  STEP 2 — FAST DATA LOADING WITH TF.DATA API
 # ============================================================
 
-print("🚀 Loading Datasets via tf.data API...")
+print(" Loading Datasets via tf.data API...")
 
 # Build raw datasets using native TensorFlow image loaders
 raw_train_ds = tf.keras.utils.image_dataset_from_directory(
@@ -295,7 +295,7 @@ model.compile(
     metrics   = ['accuracy']
 )
 
-print(f"✅ Model {MODEL_CHOICE} Built Successfully — {model.count_params():,} Total Parameters\n")
+print(f" Model {MODEL_CHOICE} Built Successfully — {model.count_params():,} Total Parameters\n")
 
 
 # ============================================================
@@ -333,7 +333,7 @@ def get_callbacks(prefix):
 #  STEP 6 — PHASE 1: FROZEN BASE TRAINING
 # ============================================================
 
-print(f"🌽 Phase 1 Training Started — {MODEL_CHOICE} (Frozen Base)...\n")
+print(f" Phase 1 Training Started — {MODEL_CHOICE} (Frozen Base)...\n")
 
 history = model.fit(
     train_ds,
@@ -347,7 +347,7 @@ with open(os.path.join(OUTPUT, f'{MODEL_CHOICE}_history_p1.json'), 'w') as f:
     json.dump(history.history, f)
 
 best_p1 = max(history.history['val_accuracy'])
-print(f"\n✅ Phase 1 Complete — Best Validation Accuracy: {best_p1*100:.2f}%\n")
+print(f"\n Phase 1 Complete — Best Validation Accuracy: {best_p1*100:.2f}%\n")
 
 
 # ============================================================
@@ -373,7 +373,7 @@ model.compile(
 )
 
 total_epochs = EPOCHS_P1 + EPOCHS_P2
-print(f"🌽 Phase 2 Fine-Tuning Started — {MODEL_CHOICE}...\n")
+print(f" Phase 2 Fine-Tuning Started — {MODEL_CHOICE}...\n")
 
 history_fine = model.fit(
     train_ds,
@@ -390,7 +390,7 @@ with open(os.path.join(OUTPUT, f'{MODEL_CHOICE}_history_p2.json'), 'w') as f:
 model.save(os.path.join(OUTPUT, f'{MODEL_CHOICE}_final.keras'))
 
 best_p2 = max(history_fine.history['val_accuracy'])
-print(f"\n✅ {MODEL_CHOICE} Fine-Tuning Complete!")
+print(f"\n {MODEL_CHOICE} Fine-Tuning Complete!")
 print(f"   Phase 1 Best Val Acc : {best_p1*100:.2f}%")
 print(f"   Phase 2 Best Val Acc : {best_p2*100:.2f}%\n")
 
@@ -401,7 +401,7 @@ print(f"   Phase 2 Best Val Acc : {best_p2*100:.2f}%\n")
 
 colors = ['#2196F3', '#FF5722', '#4CAF50', '#9C27B0']
 
-print(f"🔍 Evaluating Model on Test Set...")
+print(f" Evaluating Model on Test Set...")
 
 # Extract ground-truth test target labels directly from non-shuffled dataset batches
 true_classes = []
